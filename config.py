@@ -158,6 +158,33 @@ TP1_R = 1.0
 TP2_R = 2.0
 MIN_TARGET_PTS = 15.0    # YM ticks in whole points; below this, structure eats the edge
 
+# ----------------------------------------------------------------------------
+# Microstructure (phase 4)
+# ----------------------------------------------------------------------------
+# RVOL is measured against the SAME TIME OF DAY on prior sessions, never against
+# a flat daily average — 09:35 always looks like a volume spike next to 12:35.
+RVOL_BASELINE_DAYS = 20
+RVOL_SPIKE = 1.5          # >= this is an expansion
+RVOL_DRY = 0.6            # <= this is a dead tape; suppress breakout reads
+
+# Liquidity sweeps: price takes out a level then closes back inside it.
+SWEEP_LOOKBACK_BARS = 78          # roughly one RTH session of 5m bars
+SWEEP_EQUAL_TOL_ATR = 0.12        # highs within this x ATR count as "equal"
+SWEEP_MIN_PENETRATION_ATR = 0.05  # must genuinely break the level, not touch it
+SWEEP_REJECTION_FRAC = 0.5        # close must come back this far inside the range
+SWEEP_RVOL_CONFIRM = 1.3          # a sweep on dry volume is noise
+
+# Delta proxy. This is BAR-DERIVED, not real order flow — no L2 data in yfinance.
+DELTA_DIVERGENCE_MIN_BARS = 12
+
+# Cash-futures basis. Only meaningful during RTH: ^DJI does not tick outside it.
+BASIS_MIN_SAMPLES = 20
+
+# Regular trading hours and the Globex overnight window, US/Eastern.
+RTH_START = "09:30"
+RTH_END = "16:00"
+GLOBEX_START = "18:00"    # bars at or after this belong to the NEXT session
+
 # Time-of-day blocks (US/Eastern). Score the same setup differently by block.
 SESSION_BLOCKS = [
     ("09:30", "10:00", "OPEN_AUCTION", 0.6),

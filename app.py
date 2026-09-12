@@ -26,6 +26,7 @@ import config
 import data_layer as dl
 import dow_attribution as attr
 import us30_macro as macro_mod
+import us30_micro as micro_mod
 import us30_regime as regime_mod
 import us30_sectors as sectors_mod
 import us30_technicals as tech_mod
@@ -78,8 +79,8 @@ with st.sidebar:
     )
     st.divider()
     st.caption(
-        "**Not yet built:** L3 microstructure (phase 4), L6 options (phase 5). "
-        "Their budgets are redistributed across live layers."
+        "**Not yet built:** L6 options (phase 5). Its ±10 budget is "
+        "redistributed across live layers rather than scored zero."
     )
     if st.button("Clear cache"):
         st.cache_data.clear()
@@ -116,9 +117,14 @@ with st.spinner("Loading engines..."):
         sectors = sectors_mod.SectorReport(note=f"sectors crashed: {exc}")
 
     try:
+        micro = micro_mod.get_micro(spread_pts, slippage_pts)
+    except Exception as exc:  # noqa: BLE001
+        micro = micro_mod.MicroReport(note=f"microstructure crashed: {exc}")
+
+    try:
         signal = master.build_master_signal(
             attribution=attribution, technicals=technicals, macro=macro,
-            regime=regime, sectors=sectors,
+            regime=regime, sectors=sectors, micro=micro,
             ctx={"spread_pts": spread_pts, "slippage_pts": slippage_pts},
         )
     except Exception as exc:  # noqa: BLE001
@@ -344,6 +350,67 @@ def render_regime():
     )
 
 
+@panel("Microstructure")
+def render_micro():
+    st.subheader("Futures & microstructure")
+    if not micro.ok:
+        st.warning(micro.note or "microstructure unavailable")
+        return
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Source", micro.source)
+    c2.metric("RVOL", f"{micro.rvol:.2f}" if np.isfinite(micro.rvol) else "—",
+              micro.rvol_state,
+              help="Against the same 5-minute slot on prior sessions, not a flat daily average")
+    c3.metric("Basis", f"{micro.basis:+.0f}" if micro.basis_available else "n/a",
+              f"{micro.basis_sigma:+.1f}σ" if micro.basis_available else "outside RTH")
+    c4.metric("Round-trip cost", f"{micro.round_trip_cost:.1f} pts",
+              f"min target {micro.min_viable_target:.0f}")
+    c5.metric("Overnight state", micro.levels.state.replace("_", " ").title())
+
+    lv = micro.levels
+    st.markdown("**Session levels**")
+    levels = pd.DataFrame({
+        "level": ["Overnight high", "Initial balance high", "Prior day high",
+                  "Prior day close", "Prior day low", "Initial balance low",
+                  "Overnight low"],
+        "value": [lv.overnight_high, lv.ib_high, lv.prior_high, lv.prior_close,
+                  lv.prior_low, lv.ib_low, lv.overnight_low],
+    })
+    levels["distance"] = (levels["value"] - micro.price).round(0)
+    st.dataframe(levels.round(1), width="stretch", hide_index=True)
+    if np.isfinite(lv.on_range_position):
+        st.progress(float(np.clip(lv.on_range_position, 0.0, 1.0)),
+                    text=f"Position in overnight range: {lv.on_range_position * 100:.0f}%")
+
+    if micro.sweeps:
+        st.markdown("**Liquidity sweeps** — level taken out *and rejected*")
+        st.dataframe(pd.DataFrame([{
+            "level": s.level_name, "side": s.side, "price": round(s.level, 1),
+            "penetration": round(s.penetration, 1),
+            "RVOL": round(s.rvol, 2) if np.isfinite(s.rvol) else None,
+            "confirmed": s.confirmed, "bars ago": s.bars_ago,
+            "implies": s.implication,
+        } for s in micro.sweeps]), width="stretch", hide_index=True)
+    else:
+        st.caption("No sweeps detected in the last 12 bars.")
+
+    d1, d2 = st.columns(2)
+    d1.metric("Cumulative delta (proxy)",
+              f"{micro.cum_delta:,.0f}" if np.isfinite(micro.cum_delta) else "—",
+              f"slope {micro.delta_slope:+,.0f}")
+    d2.metric("Delta divergence", micro.delta_divergence)
+    st.warning(
+        "**Delta here is a bar-derived proxy, not order flow.** It measures where "
+        "each bar closes within its range, weighted by volume. Real delta needs "
+        "Level 2 data that yfinance does not carry — this correlates on trending "
+        "bars and is near-meaningless on inside bars. It is weighted at half "
+        "strength in the layer score for that reason."
+    )
+    for f in micro.flags:
+        st.caption(f"• {f}")
+
+
 @panel("Sectors")
 def render_sectors():
     st.subheader("Sector rotation — Dow-weighted")
@@ -369,22 +436,26 @@ def render_sectors():
 render_signal()
 st.divider()
 
-tabs = st.tabs(["Attribution", "Technicals", "Macro", "Regime", "Sectors", "Diagnostics"])
+tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Macro",
+                "Regime", "Sectors", "Diagnostics"])
 with tabs[0]:
     render_attribution()
 with tabs[1]:
     render_technicals()
 with tabs[2]:
-    render_macro()
+    render_micro()
 with tabs[3]:
-    render_regime()
+    render_macro()
 with tabs[4]:
-    render_sectors()
+    render_regime()
 with tabs[5]:
+    render_sectors()
+with tabs[6]:
     st.subheader("Diagnostics")
     st.write({
         "attribution": attribution.note,
         "technicals": technicals.note,
+        "microstructure": micro.note,
         "macro": macro.note,
         "regime": regime.note,
         "sectors": sectors.note,

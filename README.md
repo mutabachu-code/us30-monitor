@@ -94,7 +94,7 @@ a recurring source of off-by-a-bit bugs and there is no reason to repeat it.
 |---|---|---|
 | L1 Attribution & breadth | ±25 | live |
 | L2 Technicals | ±20 | live |
-| L3 Futures & microstructure | ±15 | phase 4 |
+| L3 Futures & microstructure | ±15 | live |
 | L4 Macro & rates | ±15 | live |
 | L5 Regime | ±10 | live |
 | L6 Options & gamma | ±10 | phase 5 |
@@ -104,7 +104,7 @@ a recurring source of off-by-a-bit bugs and there is no reason to repeat it.
 is not neutral — it silently drags the composite toward the midpoint and makes
 every signal look weaker than the evidence supports. Its budget is reallocated
 across the layers that did report, and the loss is shown as `coverage` in the
-UI. Current coverage with phases 4 and 5 unbuilt: **75%**.
+UI. Current coverage with phase 5 unbuilt: **90%**.
 
 ---
 
@@ -123,8 +123,43 @@ UI. Current coverage with phases 4 and 5 unbuilt: **75%**.
 | C9 | Expected move < 3× round-trip cost | Block regardless of score |
 | C10 | ≥6 live layers agree | Upgrade |
 
-C4, C5 and C7 need data phases 4–5 supply; the resolver reads them defensively
-and simply does not fire until those layers exist.
+C7 is live as of phase 4. C4 and C5 need the earnings and ex-dividend calendars
+that phase 6 adds; the resolver reads every field defensively and simply does
+not fire until the data exists.
+
+---
+
+## Phase 4 notes — what the microstructure layer can and cannot claim
+
+**Delta is a proxy.** `us30_micro.compute_delta` measures where each bar closes
+within its own range, mapped to ±1 and weighted by that bar's volume. That
+correlates with real delta on trending bars and is close to meaningless on
+inside bars. Real delta needs Level 2 / footprint data that yfinance does not
+carry. It is weighted at half strength in the layer score, labelled a proxy in
+the UI, and there is a test asserting a mid-range close contributes exactly
+zero.
+
+**RVOL is same-time-of-day.** Measured against the median volume in the same
+5-minute slot across the prior 20 sessions — never a flat daily average. A
+naive RVOL fires a volume-expansion signal at every open, because 09:35 always
+looks like a spike beside 12:35. There is a test that builds four sessions with
+a structurally heavy open and asserts RVOL reads ~1.0, not ~8.
+
+**Basis is RTH-only.** `^DJI` does not tick outside 09:30–16:00 ET, so an
+overnight "basis" is really the futures price minus a stale 16:00 print.
+Outside RTH the basis returns NaN and C7 does not fire — a test covers exactly
+that, because firing C7 on a meaningless number would block good entries every
+morning.
+
+**A sweep is a rejection, not a breakout.** Price must penetrate the level by
+at least 0.05 × ATR *and* close back inside by half the bar's range. A level
+that breaks and holds is a breakout and implies the opposite direction — the
+tests assert both cases separately, since conflating them would invert the
+signal.
+
+Session boundaries follow Globex: a bar at or after 18:00 ET belongs to the
+*next* session, and Sunday-evening bars roll to Monday. Getting this wrong
+silently merges two sessions' overnight ranges.
 
 ---
 
@@ -135,13 +170,14 @@ config.py              constituents, sector map, tickers, thresholds, TTLs
 data_layer.py          ALL yfinance access. Circuit breaker, column normalisation
 dow_attribution.py     CORE — divisor, point contributions, breadth, concentration
 us30_technicals.py     CPR, pivots, EMA, RSI + decay, ATR, VWAP, divergence
+us30_micro.py          basis, overnight/prior levels, RVOL, delta proxy, sweeps
 us30_macro.py          rates, curve, DXY, oil, VXD/VIX
 us30_regime.py         trend/chop/revert + dispersion regime
 us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neither)
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     112 checks against constructed data, no network
+tests_synthetic.py     154 checks against constructed data, no network
 ```
 
 ---
@@ -152,9 +188,9 @@ tests_synthetic.py     112 checks against constructed data, no network
 - [x] Phase 1 — attribution engine with live divisor
 - [x] Phase 2 — technicals on the correct tickers
 - [x] Phase 3 — macro, rates, sectors
-- [ ] Phase 4 — YM basis, overnight levels, RVOL, sweeps, delta proxy
+- [x] Phase 4 — YM basis, overnight levels, RVOL, sweeps, delta proxy
 - [ ] Phase 5 — component-weighted options gamma across the top 8
-- [ ] Phase 6 — full conflict resolver with C4/C5/C7 data
+- [ ] Phase 6 — earnings and ex-dividend calendars to activate C4/C5
 - [ ] Phase 7 — `us30_journal.py`, 60-day forward test, **no live trading**
 - [ ] Phase 8 — MT5 wiring: point calibration, ATR sizing, R-aware breaker
 
