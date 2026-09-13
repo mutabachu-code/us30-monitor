@@ -67,7 +67,7 @@ trusting any panel. Its output will revise some assumptions.
 The synthetic suite covers the part that breaks quietly — the maths:
 
 ```bash
-python tests_synthetic.py       # 304 checks, no network required
+python tests_synthetic.py       # 403 checks, no network required
 ```
 
 ---
@@ -274,10 +274,11 @@ us30_macro.py          rates, curve, DXY, oil, VXD/VIX
 us30_regime.py         trend/chop/revert + dispersion regime
 us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neither)
 us30_calendar.py       event risk, earnings, ex-dividends, DJIA/NDX correlation
+us30_journal.py        signal ledger, realised expectancy, forward-test gates
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     304 checks against constructed data, no network
+tests_synthetic.py     403 checks against constructed data, no network
 ```
 
 ---
@@ -291,8 +292,57 @@ tests_synthetic.py     304 checks against constructed data, no network
 - [x] Phase 4 — YM basis, overnight levels, RVOL, sweeps, delta proxy
 - [x] Phase 5 — component-weighted options gamma across the top 8
 - [x] Phase 6 — event calendar, earnings, ex-dividends, cross-index (C4/C5/C8/C14)
-- [ ] Phase 7 — `us30_journal.py`, 60-day forward test, **no live trading**
+- [x] Phase 7 — `us30_journal.py`, forward-test gates, **no live trading yet**
 - [ ] Phase 8 — MT5 wiring: point calibration, ATR sizing, R-aware breaker
+
+---
+
+## Phase 7 notes — the part that can actually answer the question
+
+Everything before this is a hypothesis. Six phases of engines produce a number
+whose relationship to money is entirely unmeasured. `us30_journal.py` records
+what the dashboard claimed, what happened, and grades the difference.
+
+**Win rate is never shown bare.** Every win rate carries its Wilson 95%
+interval and its n. "100%" from one trade renders as `100% (95% CI 21–100%,
+n=1)`, which is the truth. A bare percentage from a small sample is how a
+system talks its owner into trusting noise. The interval is validated in the
+tests against an independent quadratic solution of the Wilson equation, not
+against a remembered constant.
+
+**Expectancy is the headline.** The journal grades against expectancy in index
+points and profit factor, with win rate as context. It also computes
+`breakeven_win_rate(rr, cost, risk)` against the system's OWN realised R and
+reports whether the achieved rate clears it — the identity from the research
+doc applied to real numbers rather than restated as a claim.
+
+**Every layer score is stored, not just the composite.** Seven extra columns
+per row, so you can afterwards ask which layers actually predicted anything.
+The Journal tab charts each layer's correlation with realised points once n≥10.
+The honest answer may be that some layers are decoration, and that question is
+worth more than the win rate.
+
+**Both forward-test gates must clear: 30 trades AND 60 days.** Thirty trades
+from one week is one market regime wearing a sample's clothing.
+
+**Blocked signals are never logged.** A block is the system working correctly,
+not a trade. Logging them would make every rate computed from the ledger
+meaningless.
+
+### The persistence trap
+
+**Streamlit Cloud's filesystem is ephemeral.** It is wiped on every reboot and
+redeploy. A journal written only there will lose the forward test silently —
+you would not find out until you went looking for the results. The app detects
+the host and shows a red banner when storage is not durable.
+
+Two working options:
+
+1. **Export regularly.** The Journal tab has a download button and a restore
+   uploader that merges by `signal_id` + `logged_at`. Low-tech and reliable.
+2. **Run the durable copy on the MT5 host.** Your bot already imports these
+   modules directly, and that machine has a real filesystem. `CsvStore` works
+   there unchanged and `durable` reports `True`. This is the better path.
 
 ---
 

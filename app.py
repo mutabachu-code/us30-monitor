@@ -27,6 +27,7 @@ import data_layer as dl
 import dow_attribution as attr
 import dow_options as options_mod
 import us30_calendar as cal_mod
+import us30_journal as journal_mod
 import us30_macro as macro_mod
 import us30_micro as micro_mod
 import us30_regime as regime_mod
@@ -43,7 +44,7 @@ st.set_page_config(page_title="US30 Monitor", page_icon="📉", layout="wide")
 # lands a module before its config constants used to kill the app at import
 # time with a redacted AttributeError. Now the modules carry their own
 # fallbacks and this banner names exactly which file is behind.
-EXPECTED_CONFIG_VERSION = 4
+EXPECTED_CONFIG_VERSION = 5
 
 
 # Lives in data_layer so it is unit-testable; reached through getattr so that a
@@ -52,7 +53,7 @@ _module_health = getattr(dl, "module_health", lambda m: ([], []))
 
 _missing: list[str] = []
 _stale_modules: list[str] = []
-for _mod in (micro_mod, options_mod, cal_mod):
+for _mod in (micro_mod, options_mod, cal_mod, journal_mod):
     _m, _s = _module_health(_mod)
     _missing += _m
     _stale_modules += _s
@@ -121,6 +122,16 @@ with st.sidebar:
         "Expected slippage (index points)", 0.0, 50.0, config.DEFAULT_SLIPPAGE_PTS, 0.5,
         help="Measure from your own MT5 fills. Do not model it optimistically.",
     )
+    st.divider()
+    st.subheader("Forward test")
+    paper_mode = st.toggle(
+        "Paper mode", value=True,
+        help="Rows are marked paper. Leave this on until the forward test clears "
+             "both gates — 30 trades AND 60 days.")
+    auto_log = st.toggle(
+        "Auto-log actionable signals", value=True,
+        help="Blocked signals are never logged — a block is the system working, "
+             "not a trade.")
     st.divider()
     st.caption(
         "**All seven layers built.** L6 options still reports unavailable when "
@@ -205,6 +216,23 @@ with st.spinner("Loading engines..."):
         signal = master.MasterSignal()
         st.error(f"Master signal failed: {exc}")
 
+    # ---- journal ---------------------------------------------------------
+    try:
+        store = journal_mod.get_store()
+        journal_mod.expire_stale(store, now_et)
+        logged, log_reason = (False, "auto-log off")
+        if auto_log:
+            logged, log_reason = journal_mod.log_signal(
+                store, signal, now_et, regime=regime, options=options,
+                paper=paper_mode, spread_pts=spread_pts, slippage_pts=slippage_pts)
+        journal_frame = store.load()
+        metrics = journal_mod.compute_metrics(journal_frame)
+    except Exception as exc:  # noqa: BLE001
+        store = journal_mod.MemoryStore()
+        journal_frame = journal_mod.empty_frame()
+        metrics = journal_mod.Metrics()
+        logged, log_reason = False, f"journal crashed: {exc}"
+
 
 # ==========================================================================
 # Master signal
@@ -254,6 +282,35 @@ def render_signal():
 
     for n in signal.notes:
         st.caption(n)
+
+    # The research doc promised realised expectancy would sit on the front
+    # page, not buried in a tab. This is that promise.
+    st.markdown("---")
+    st.markdown("**Realised performance** — what this system has actually done")
+    e1, e2, e3, e4, e5 = st.columns(5)
+    e1.metric("Expectancy",
+              f"{metrics.expectancy_pts:+.1f} pts" if np.isfinite(metrics.expectancy_pts) else "—",
+              f"target ≥ {getattr(config, 'TARGET_EXPECTANCY_PTS', 8.0):.0f}")
+    pf = metrics.profit_factor
+    e2.metric("Profit factor",
+              f"{pf:.2f}" if np.isfinite(pf) and pf != float("inf") else ("∞" if pf == float("inf") else "—"),
+              f"target ≥ {getattr(config, 'TARGET_PROFIT_FACTOR', 1.4):.1f}")
+    e3.metric("Win rate", metrics.win_rate_text,
+              help="Always shown with its 95% Wilson interval. A bare percentage "
+                   "from a small sample is how a system talks you into trusting noise.")
+    e4.metric("Closed / open", f"{metrics.n_closed} / {metrics.n_open}")
+    e5.metric("Verdict", metrics.verdict)
+
+    if metrics.verdict == "FORWARD TEST IN PROGRESS":
+        min_t = int(getattr(config, "FORWARD_TEST_MIN_TRADES", 30))
+        min_d = int(getattr(config, "FORWARD_TEST_MIN_DAYS", 60))
+        p1, p2 = st.columns(2)
+        p1.progress(min(metrics.n_closed / max(min_t, 1), 1.0),
+                    text=f"Trades {metrics.n_closed}/{min_t}")
+        p2.progress(min(metrics.days_elapsed / max(min_d, 1), 1.0),
+                    text=f"Days {metrics.days_elapsed}/{min_d}")
+    if metrics.warnings:
+        st.caption("⚠️ " + metrics.warnings[0])
 
 
 # ==========================================================================
@@ -656,6 +713,145 @@ def _humanise_minutes(minutes: float) -> str:
     return f"{minutes / 1440:.1f} days"
 
 
+@panel("Journal")
+def render_journal():
+    st.subheader("Forward-test journal")
+
+    warning = journal_mod.storage_warning(store)
+    if warning:
+        st.error(f"**{warning}**")
+    else:
+        st.success(f"Journal stored at `{store.location}` — filesystem is durable here.")
+
+    st.caption(
+        f"Auto-log: {'on' if auto_log else 'off'} · last attempt: {log_reason} · "
+        f"mode: {'PAPER' if paper_mode else 'LIVE'}"
+    )
+
+    # ---- headline -------------------------------------------------------
+    m = metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expectancy",
+              f"{m.expectancy_pts:+.1f} pts" if np.isfinite(m.expectancy_pts) else "—",
+              f"{m.expectancy_r:+.2f}R" if np.isfinite(m.expectancy_r) else "")
+    c2.metric("Total", f"{m.total_pts:+,.0f} pts" if np.isfinite(m.total_pts) else "—")
+    c3.metric("Max consecutive losses", m.max_consecutive_losses,
+              help="Your bot halts after 2. At a lower win rate this fires often — "
+                   "see the R-aware circuit-breaker note in the README.")
+    c4.metric("Avg slippage",
+              f"{m.avg_slippage_pts:.1f} pts" if np.isfinite(m.avg_slippage_pts) else "—",
+              help="Measured from actual fills, not modelled.")
+
+    for w in m.warnings:
+        st.warning(w)
+
+    # ---- break-even identity, applied to the system's own numbers -------
+    cost = spread_pts + slippage_pts
+    grade = journal_mod.grade_against_breakeven(m, cost)
+    if np.isfinite(grade["required"]):
+        st.markdown("**Against its own break-even**")
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Win rate required", f"{grade['required'] * 100:.1f}%",
+                  help="(1 + cost/risk) / (R + 1) at this system's realised R")
+        g2.metric("Win rate achieved", f"{m.win_rate * 100:.1f}%",
+                  f"{grade['margin'] * 100:+.1f} pts")
+        g3.metric("Verdict", grade["verdict"])
+        st.caption(
+            "This is the identity from the research doc applied to your own "
+            "realised numbers rather than restated as a claim. At 0.5:1 "
+            "reward-to-risk with a 40pt stop and 5pts of cost, break-even is "
+            "exactly 75% — which is why win rate was never the target."
+        )
+
+    # ---- breakdowns ------------------------------------------------------
+    if not m.by_regime.empty:
+        st.markdown("**By regime** — a system that is +20 in trend and −12 in chop "
+                    "is not a 60% system, it is a regime filter waiting to be built")
+        st.dataframe(m.by_regime, width="stretch")
+    if not m.by_session.empty:
+        st.markdown("**By session block**")
+        st.dataframe(m.by_session, width="stretch")
+    if not m.by_conviction.empty:
+        st.markdown("**By conviction tier** — if VERY STRONG does not beat WEAK, "
+                    "the scoring is not carrying information")
+        st.dataframe(m.by_conviction, width="stretch")
+    if not m.layer_correlation.empty:
+        st.markdown("**Which layers actually predicted anything**")
+        st.caption(
+            "Correlation between each layer's score and realised points. This is "
+            "the question the per-layer columns exist to answer, and the honest "
+            "answer may be that some layers are decoration. Needs n≥10 per layer."
+        )
+        st.bar_chart(m.layer_correlation)
+
+    # ---- record an outcome -----------------------------------------------
+    st.markdown("---")
+    st.markdown("**Record an outcome**")
+    open_rows = journal_frame[journal_frame["status"].astype(str) == journal_mod.OPEN] \
+        if not journal_frame.empty else journal_mod.empty_frame()
+    if open_rows.empty:
+        st.caption("No open signals to close.")
+    else:
+        labels = {
+            f"{r['signal_id']} · {r['direction']} @ {r['entry']:.0f} "
+            f"({str(r['logged_at'])[:16]})": r["signal_id"]
+            for _, r in open_rows.iterrows()
+        }
+        with st.form("record_outcome"):
+            chosen = st.selectbox("Signal", list(labels.keys()))
+            o1, o2 = st.columns(2)
+            exit_price = o1.number_input("Exit price", value=0.0, step=1.0, format="%.1f")
+            actual_entry = o2.number_input(
+                "Actual fill (0 = use planned)", value=0.0, step=1.0, format="%.1f",
+                help="Enter your real MT5 fill. The gap between this and the "
+                     "planned entry IS your slippage — the thing backtests lie about.")
+            reason = st.selectbox("Exit reason",
+                                  ["TP1", "TP2", "Stop", "Manual", "Time", "Event"])
+            note = st.text_input("Notes", "")
+            if st.form_submit_button("Record"):
+                ok, msg = journal_mod.record_outcome(
+                    store, labels[chosen], exit_price, now_et, reason,
+                    actual_entry if actual_entry > 0 else None, note)
+                st.success(f"Recorded: {msg}") if ok else st.error(msg)
+                st.rerun()
+
+    # ---- export / import --------------------------------------------------
+    st.markdown("---")
+    st.markdown("**Export and import** — the only thing standing between you and "
+                "losing the forward test to a redeploy")
+    x1, x2 = st.columns(2)
+    with x1:
+        st.download_button(
+            "Download journal CSV",
+            journal_frame.to_csv(index=False).encode(),
+            file_name=f"us30_journal_{now_et:%Y%m%d}.csv",
+            mime="text/csv",
+            disabled=journal_frame.empty,
+        )
+    with x2:
+        uploaded = st.file_uploader("Restore from CSV", type="csv")
+        if uploaded is not None:
+            try:
+                restored = pd.read_csv(uploaded)
+                for col in journal_mod.COLUMNS:
+                    if col not in restored.columns:
+                        restored[col] = np.nan
+                merged = pd.concat([journal_frame, restored[journal_mod.COLUMNS]],
+                                   ignore_index=True)
+                merged = merged.drop_duplicates(
+                    subset=["signal_id", "logged_at"], keep="last")
+                store.save(merged)
+                st.success(f"Merged — journal now holds {len(merged)} rows.")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read that CSV: {exc}")
+
+    if not journal_frame.empty:
+        st.markdown("**Full ledger**")
+        st.dataframe(journal_frame.sort_values("logged_at", ascending=False),
+                     width="stretch", height=360)
+
+
 @panel("Sectors")
 def render_sectors():
     st.subheader("Sector rotation — Dow-weighted")
@@ -682,7 +878,8 @@ render_signal()
 st.divider()
 
 tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Options",
-                "Macro", "Regime", "Sectors", "Calendar", "Diagnostics"])
+                "Macro", "Regime", "Sectors", "Calendar", "Journal",
+                "Diagnostics"])
 with tabs[0]:
     render_attribution()
 with tabs[1]:
@@ -700,6 +897,8 @@ with tabs[6]:
 with tabs[7]:
     render_calendar()
 with tabs[8]:
+    render_journal()
+with tabs[9]:
     st.subheader("Diagnostics")
     st.write({
         "attribution": attribution.note,
@@ -707,6 +906,8 @@ with tabs[8]:
         "microstructure": micro.note,
         "options": options.note,
         "calendar": calendar.note,
+        "journal": f"{metrics.n_closed} closed / {metrics.n_open} open at {store.location}",
+        "journal_durable": getattr(store, "durable", False),
         "macro": macro.note,
         "regime": regime.note,
         "sectors": sectors.note,

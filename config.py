@@ -15,8 +15,8 @@ from __future__ import annotations
 # modules expect and names the stale file, instead of dying on a redacted
 # AttributeError before a single panel renders.
 #   1 = phases 0-3   2 = phase 4 (microstructure)   3 = phase 5 (options)
-#   4 = phase 6 (calendar)
-CONFIG_VERSION = 4
+#   4 = phase 6 (calendar)   5 = phase 7 (journal)
+CONFIG_VERSION = 5
 
 # ----------------------------------------------------------------------------
 # Constituents (seed list — verified 12 Sep 2026, post GOOGL/VZ swap of 29 Jun 2026)
@@ -241,6 +241,31 @@ CROSS_CORR_WINDOW = 20
 CROSS_CORR_HIGH = 0.70
 CROSS_CORR_LOW = 0.35
 CROSS_DIRECTION_LOOKBACK = 5
+
+# ----------------------------------------------------------------------------
+# Journal / forward test (phase 7)
+# ----------------------------------------------------------------------------
+JOURNAL_PATH = "us30_journal.csv"
+
+# The dashboard re-renders on every interaction. Without a fingerprint window
+# a single setup would be logged dozens of times and the sample would be
+# fiction — inflated n, correlated rows, meaningless statistics.
+JOURNAL_DEDUP_MINUTES = 20
+
+# Forward-test gates. BOTH must be met before the results mean anything.
+# Days alone are not enough (a quiet month is not evidence) and trades alone
+# are not enough (30 trades from one week is one market regime).
+FORWARD_TEST_MIN_DAYS = 60
+FORWARD_TEST_MIN_TRADES = 30
+
+# Below this, a win rate is noise. The UI reports a Wilson confidence interval
+# rather than a bare percentage at every sample size, but shouts below this.
+JOURNAL_MIN_SAMPLE = 30
+JOURNAL_CI_Z = 1.96          # 95%
+
+# Targets from the research doc, restated here so the app can grade itself.
+TARGET_EXPECTANCY_PTS = 8.0
+TARGET_PROFIT_FACTOR = 1.4
 
 # Time-of-day blocks (US/Eastern). Score the same setup differently by block.
 SESSION_BLOCKS = [

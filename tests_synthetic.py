@@ -1421,7 +1421,395 @@ check("layers are still 7 — the calendar is a gate, not a layer",
 
 
 # ==========================================================================
-print("\n[12] Data layer guards")
+print("\n[12] Journal — phase 7")
+# ==========================================================================
+import us30_journal as jr  # noqa: E402
+
+# ---- Wilson interval against known values ---------------------------------
+lo, hi = jr.wilson_interval(13, 21)          # 62% from 21 trades
+check("Wilson interval brackets the point estimate",
+      lo < 13 / 21 < hi, f"{lo:.3f} {hi:.3f}")
+check("small sample gives a wide interval", (hi - lo) > 0.30,
+      f"width {(hi - lo):.3f}")
+
+
+
+def wilson_by_quadratic(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """
+    Independent derivation: the Wilson bounds are the roots of
+        (p_hat - p)^2 = z^2 * p(1-p)/n
+    i.e.  p^2 (1 + z^2/n) - p(2*p_hat + z^2/n) + p_hat^2 = 0
+    Solved numerically here so it shares no code with the implementation —
+    validating the formula rather than a constant someone remembered.
+    """
+    ph = wins / n
+    roots = np.roots([1 + z * z / n, -(2 * ph + z * z / n), ph * ph])
+    return float(min(roots)), float(max(roots))
+
+
+for _w, _n in [(13, 21), (6, 10), (130, 210), (1, 4), (99, 100)]:
+    _q = wilson_by_quadratic(_w, _n)
+    _i = jr.wilson_interval(_w, _n)
+    check(f"Wilson {_w}/{_n} matches an independent quadratic solution",
+          close_to(_q[0], _i[0], 1e-10) and close_to(_q[1], _i[1], 1e-10),
+          f"quadratic={_q[0]:.6f},{_q[1]:.6f} impl={_i[0]:.6f},{_i[1]:.6f}")
+lo2, hi2 = jr.wilson_interval(130, 210)      # same rate, 10x the sample
+check("ten times the sample narrows the interval", (hi2 - lo2) < (hi - lo) / 2,
+      f"{(hi2 - lo2):.3f} vs {(hi - lo):.3f}")
+check("interval stays inside [0,1] at the extremes",
+      jr.wilson_interval(0, 5)[0] >= 0.0 and jr.wilson_interval(5, 5)[1] <= 1.0)
+check("n=0 yields NaN, not a divide-by-zero",
+      not np.isfinite(jr.wilson_interval(0, 0)[0]))
+
+# ---- break-even identity from the research doc ----------------------------
+check("75% is break-even at 0.5:1 with a 40pt stop and 5pts cost",
+      close_to(jr.breakeven_win_rate(0.5, 5.0, 40.0), 0.75, 1e-9),
+      f"{jr.breakeven_win_rate(0.5, 5.0, 40.0)}")
+check("1:1 with no cost is exactly 50%",
+      close_to(jr.breakeven_win_rate(1.0, 0.0, 40.0), 0.50, 1e-12))
+check("1:1 with 5pts cost is 56.25%",
+      close_to(jr.breakeven_win_rate(1.0, 5.0, 40.0), 0.5625, 1e-9))
+check("3:1 with 5pts cost is 28.125%",
+      close_to(jr.breakeven_win_rate(3.0, 5.0, 40.0), 0.28125, 1e-9))
+check("higher R needs a lower win rate",
+      jr.breakeven_win_rate(2.0, 5, 40) < jr.breakeven_win_rate(1.0, 5, 40))
+check("zero risk degrades safely",
+      not np.isfinite(jr.breakeven_win_rate(1.0, 5.0, 0.0)))
+
+# ---- fingerprint dedup -----------------------------------------------------
+fp_a = jr.fingerprint("LONG", 52.0, "MORNING_TREND", 52000.0)
+check("same setup gives the same fingerprint",
+      fp_a == jr.fingerprint("LONG", 52.0, "MORNING_TREND", 52000.0))
+check("a small score drift collapses to the same fingerprint",
+      fp_a == jr.fingerprint("LONG", 54.0, "MORNING_TREND", 52010.0),
+      "score 52->54 and entry 52000->52010 are the same setup")
+check("a direction flip is a different fingerprint",
+      fp_a != jr.fingerprint("SHORT", 52.0, "MORNING_TREND", 52000.0))
+check("a different session block is a different fingerprint",
+      fp_a != jr.fingerprint("LONG", 52.0, "LUNCH_CHOP", 52000.0))
+check("a large entry move is a different fingerprint",
+      fp_a != jr.fingerprint("LONG", 52.0, "MORNING_TREND", 52500.0))
+check("NaN inputs do not raise",
+      isinstance(jr.fingerprint("LONG", float("nan"), "X", float("nan")), str))
+
+# ---- store round trip -------------------------------------------------------
+import tempfile, os as _os  # noqa: E402
+
+_tmpdir = tempfile.mkdtemp()
+_path = _os.path.join(_tmpdir, "journal.csv")
+csv_store = jr.CsvStore(_path)
+check("a missing file loads as an empty frame with the full schema",
+      list(csv_store.load().columns) == jr.COLUMNS)
+
+NOW_J = pd.Timestamp("2026-09-14 10:30", tz=TZ).to_pydatetime()
+
+
+def make_signal(direction="LONG", score=55.0, entry=52000.0, valid=True,
+                blocked=False, ok=True, block="MORNING_TREND"):
+    sig = master.MasterSignal(ok=ok)
+    sig.direction, sig.final_score = direction, score
+    sig.conviction, sig.coverage, sig.confidence = "STRONG", 1.0, 0.8
+    sig.session_block, sig.blocked = block, blocked
+    sig.layers = [
+        master.Layer("attribution", "L1", 25, 20.0, 0.9, True),
+        master.Layer("technicals", "L2", 20, 15.0, 0.9, True),
+        master.Layer("options", "L6", 10, 0.0, 0.0, False),
+    ]
+    plan = master.TradePlan()
+    plan.direction = direction
+    plan.entry, plan.stop = entry, entry - 480.0
+    plan.tp1, plan.tp2 = entry + 480.0, entry + 960.0
+    plan.risk_pts, plan.rr, plan.lot_multiplier = 480.0, 2.0, 0.7
+    plan.valid = valid
+    sig.plan = plan
+    return sig
+
+
+ok1, why1 = jr.log_signal(csv_store, make_signal(), NOW_J)
+check("an actionable signal is logged", ok1, why1)
+check("the row survives a round trip through CSV", len(csv_store.load()) == 1)
+
+ok2, why2 = jr.log_signal(csv_store, make_signal(), NOW_J + pd.Timedelta(minutes=5))
+check("the same setup 5 minutes later is deduped", not ok2, why2)
+check("dedup names the window", "duplicate" in why2, why2)
+
+ok3, _ = jr.log_signal(csv_store, make_signal(),
+                       NOW_J + pd.Timedelta(minutes=25))
+check("the same setup past the dedup window logs again", ok3)
+
+ok4, why4 = jr.log_signal(csv_store, make_signal(blocked=True),
+                          NOW_J + pd.Timedelta(hours=1))
+check("a BLOCKED signal is never logged", not ok4, why4)
+check("blocked rows explain themselves", "not a trade" in why4, why4)
+
+ok5, why5 = jr.log_signal(csv_store, make_signal(valid=False),
+                          NOW_J + pd.Timedelta(hours=2))
+check("a signal with no valid plan is not logged", not ok5, why5)
+
+check("only real setups reached the ledger", len(csv_store.load()) == 2)
+
+# Per-layer capture is the point of the schema.
+row0 = csv_store.load().iloc[0]
+check("available layer scores are captured",
+      close_to(float(row0["l1_attribution"]), 20.0, 1e-9)
+      and close_to(float(row0["l2_technicals"]), 15.0, 1e-9))
+check("an unavailable layer is NaN, not zero",
+      not np.isfinite(pd.to_numeric(row0["l6_options"], errors="coerce")),
+      f"{row0['l6_options']}")
+check("paper mode is recorded", bool(row0["paper"]))
+
+# ---- THE dtype trap: recording an outcome through a real CSV round trip -----
+# An all-empty text column reads back from CSV as float64, and pandas 3 refuses
+# to write a string into it. This only fails on the real storage path, which is
+# why an in-memory test suite missed it entirely.
+_p2 = _os.path.join(_tmpdir, "dtype.csv")
+_cs2 = jr.CsvStore(_p2)
+jr.log_signal(_cs2, make_signal(entry=52000.0), NOW_J)
+_sid_csv = _cs2.load().iloc[0]["signal_id"]
+_okc, _stc = jr.record_outcome(_cs2, _sid_csv, 52480.0, NOW_J, "TP1")
+check("an outcome can be recorded through a fresh CSV journal", _okc, _stc)
+check("the CSV outcome computed correctly",
+      close_to(float(_cs2.load().iloc[0]["realised_pts"]), 480.0, 1e-6))
+check("text columns survive as text after a CSV round trip",
+      isinstance(_cs2.load().iloc[0]["exit_reason"], str))
+check("coerce_schema makes an empty frame writable",
+      jr.empty_frame()[jr.TEXT_COLUMNS].dtypes.apply(
+          lambda d: d == object).all())
+
+# ---- outcomes ---------------------------------------------------------------
+mem = jr.MemoryStore()
+sid = None
+jr.log_signal(mem, make_signal(entry=52000.0), NOW_J)
+sid = mem.load().iloc[0]["signal_id"]
+
+okw, status = jr.record_outcome(mem, sid, 52480.0, NOW_J + pd.Timedelta(hours=1), "TP1")
+check("a winning outcome is recorded", okw and status == jr.WIN, status)
+closed = mem.load().iloc[0]
+check("realised points computed from entry", close_to(float(closed["realised_pts"]), 480.0, 1e-6))
+check("realised R computed from risk", close_to(float(closed["realised_r"]), 1.0, 1e-6))
+
+check("closing an already-closed row is refused",
+      not jr.record_outcome(mem, sid, 52000.0)[0])
+check("an unknown id is refused", not jr.record_outcome(mem, "deadbeef", 52000.0)[0])
+
+# Short direction must invert the sign.
+mem2 = jr.MemoryStore()
+jr.log_signal(mem2, make_signal(direction="SHORT", entry=52000.0), NOW_J)
+sid2 = mem2.load().iloc[0]["signal_id"]
+jr.record_outcome(mem2, sid2, 51600.0, NOW_J, "TP1")
+check("a short that fell is a WIN with positive points",
+      mem2.load().iloc[0]["status"] == jr.WIN
+      and close_to(float(mem2.load().iloc[0]["realised_pts"]), 400.0, 1e-6),
+      str(mem2.load().iloc[0]["realised_pts"]))
+
+# Slippage measured from the actual fill, not the plan.
+mem3 = jr.MemoryStore()
+jr.log_signal(mem3, make_signal(entry=52000.0), NOW_J)
+sid3 = mem3.load().iloc[0]["signal_id"]
+jr.record_outcome(mem3, sid3, 52400.0, NOW_J, "TP1", actual_entry=52007.0)
+r3 = mem3.load().iloc[0]
+check("slippage measured from the real fill",
+      close_to(float(r3["actual_slippage_pts"]), 7.0, 1e-6))
+check("realised points use the actual fill, not the plan",
+      close_to(float(r3["realised_pts"]), 393.0, 1e-6),
+      f"{r3['realised_pts']} — 52400 minus the 52007 fill, not the 52000 plan")
+
+# Scratch.
+mem4 = jr.MemoryStore()
+jr.log_signal(mem4, make_signal(entry=52000.0), NOW_J)
+jr.record_outcome(mem4, mem4.load().iloc[0]["signal_id"], 52000.2, NOW_J, "Manual")
+check("a flat exit is a SCRATCH, not a win",
+      mem4.load().iloc[0]["status"] == jr.SCRATCH)
+
+# ---- expiry ------------------------------------------------------------------
+mem5 = jr.MemoryStore()
+jr.log_signal(mem5, make_signal(), NOW_J)
+check("nothing expires inside the window",
+      jr.expire_stale(mem5, NOW_J + pd.Timedelta(hours=2)) == 0)
+check("an open row older than 24h expires",
+      jr.expire_stale(mem5, NOW_J + pd.Timedelta(hours=30)) == 1)
+check("expired rows leave the open count",
+      jr.compute_metrics(mem5.load()).n_open == 0)
+
+# ---- metrics against hand-computed values -------------------------------------
+def ledger(results, direction="LONG", risk=100.0, start="2026-07-01"):
+    """results: list of realised points. Builds a closed ledger."""
+    rows = []
+    for i, pts in enumerate(results):
+        stamp = pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=i)
+        rows.append({
+            **{c: np.nan for c in jr.COLUMNS},
+            "signal_id": f"id{i}", "logged_at": stamp.isoformat(),
+            "session_block": "MORNING_TREND" if i % 2 else "LUNCH_CHOP",
+            "direction": direction, "score": 50.0, "conviction": "STRONG",
+            "entry": 52000.0, "risk_pts": risk,
+            "l1_attribution": 20.0 + i, "l2_technicals": 10.0,
+            "regime": "TREND" if i % 2 else "CHOP",
+            "status": jr.WIN if pts > 0.5 else (jr.LOSS if pts < -0.5 else jr.SCRATCH),
+            "realised_pts": pts, "realised_r": pts / risk,
+            "blocked": False, "paper": True,
+        })
+    return pd.DataFrame(rows)[jr.COLUMNS]
+
+
+# 6 wins of +150, 4 losses of -100. Expectancy = (900-400)/10 = +50.
+m = jr.compute_metrics(ledger([150, -100, 150, -100, 150, -100, 150, -100, 150, 150]))
+check("closed count correct", m.n_closed == 10)
+check("wins and losses counted", m.wins == 6 and m.losses == 4)
+check("win rate is 60%", close_to(m.win_rate, 0.6, 1e-9))
+check("expectancy is +50 points", close_to(m.expectancy_pts, 50.0, 1e-9),
+      f"{m.expectancy_pts}")
+check("total is +500 points", close_to(m.total_pts, 500.0, 1e-9))
+check("profit factor is 900/400 = 2.25",
+      close_to(m.profit_factor, 2.25, 1e-9), f"{m.profit_factor}")
+check("average win is +150", close_to(m.avg_win_pts, 150.0, 1e-9))
+check("average loss is -100", close_to(m.avg_loss_pts, -100.0, 1e-9))
+check("expectancy in R is +0.5", close_to(m.expectancy_r, 0.5, 1e-9))
+check("win rate carries an interval", np.isfinite(m.win_rate_low))
+check("win rate text shows the interval and n",
+      "CI" in m.win_rate_text and "n=10" in m.win_rate_text, m.win_rate_text)
+
+# Max consecutive losses.
+m_run = jr.compute_metrics(ledger([100, -50, -50, -50, 100, -50, -50, 100]))
+check("max consecutive losses found", m_run.max_consecutive_losses == 3,
+      str(m_run.max_consecutive_losses))
+check("max_consecutive helper handles no losses",
+      jr.max_consecutive(pd.Series([jr.WIN, jr.WIN]), jr.LOSS) == 0)
+
+# The research doc's two systems, reproduced through the journal.
+win_optimised = jr.compute_metrics(ledger([20] * 78 + [-40] * 22, risk=40.0))
+balanced = jr.compute_metrics(ledger([40] * 70 + [-40] * 30, risk=40.0))
+check("78% at 0.5:1 shows a high win rate", close_to(win_optimised.win_rate, 0.78, 1e-9))
+check("70% at 1:1 shows a lower win rate", close_to(balanced.win_rate, 0.70, 1e-9))
+check("...yet the lower win rate has far better expectancy",
+      balanced.expectancy_pts > win_optimised.expectancy_pts * 2,
+      f"balanced={balanced.expectancy_pts:.1f} "
+      f"win-optimised={win_optimised.expectancy_pts:.1f}")
+check("...and a better profit factor",
+      balanced.profit_factor > win_optimised.profit_factor,
+      f"{balanced.profit_factor:.2f} vs {win_optimised.profit_factor:.2f}")
+
+# Grading against break-even.
+g = jr.grade_against_breakeven(win_optimised, cost_pts=5.0)
+check("the win-optimised system is graded against its own R",
+      np.isfinite(g["required"]), str(g))
+check("78% at 0.5:1 does NOT clear break-even with confidence",
+      g["verdict"] != "clears break-even with confidence", str(g))
+
+# ---- sample-size and forward-test gates ----------------------------------------
+small = jr.compute_metrics(ledger([100, -50, 100, -50, 100]))
+check("a 5-trade sample is flagged inadequate", not small.sample_adequate)
+check("the inadequate-sample warning names the interval width",
+      any("noise, not a result" in w for w in small.warnings), str(small.warnings))
+check("an incomplete forward test says so",
+      small.verdict == "FORWARD TEST IN PROGRESS", small.verdict)
+
+# 40 trades but all on consecutive days from one start -> days gate matters.
+many_days = ledger([50, -30] * 20, start="2026-06-01")
+m_days = jr.compute_metrics(many_days)
+check("40 trades over 40 days still fails the 60-day gate",
+      not m_days.forward_test_complete,
+      f"n={m_days.n_closed} days={m_days.days_elapsed}")
+check("the days/trades warning names both gates",
+      any("BOTH gates" in w for w in m_days.warnings), str(m_days.warnings))
+
+# Both gates cleared.
+full = ledger([50, -30] * 20, start="2026-05-01")
+full.loc[len(full) - 1, "logged_at"] = pd.Timestamp("2026-08-01", tz="UTC").isoformat()
+m_full = jr.compute_metrics(full)
+check("both gates cleared completes the forward test", m_full.forward_test_complete,
+      f"n={m_full.n_closed} days={m_full.days_elapsed}")
+check("a completed test that meets targets says so",
+      m_full.verdict in ("MEETS TARGETS", "POSITIVE BUT BELOW TARGET"), m_full.verdict)
+
+negative = ledger([30, -60] * 20, start="2026-05-01")
+negative.loc[len(negative) - 1, "logged_at"] = pd.Timestamp("2026-08-01", tz="UTC").isoformat()
+check("negative expectancy is called negative",
+      jr.compute_metrics(negative).verdict == "NEGATIVE EXPECTANCY")
+
+# ---- breakdowns -----------------------------------------------------------------
+check("regime breakdown splits trend from chop",
+      set(m.by_regime.index) == {"TREND", "CHOP"}, str(m.by_regime.index.tolist()))
+check("each regime row carries its own interval",
+      "CI_low_%" in m.by_regime.columns)
+check("session breakdown is produced", not m.by_session.empty)
+check("breakdown n sums to the closed count",
+      int(m.by_regime["n"].sum()) == m.n_closed)
+
+big = ledger([150, -100] * 15)
+m_big = jr.compute_metrics(big)
+check("layer correlation computed once n is adequate",
+      not m_big.layer_correlation.empty, str(m_big.layer_correlation))
+
+# ---- empty and malformed ---------------------------------------------------------
+m_empty = jr.compute_metrics(jr.empty_frame())
+check("an empty journal degrades safely",
+      m_empty.n_closed == 0 and m_empty.verdict == "INSUFFICIENT DATA")
+check("the empty journal says it is empty",
+      any("empty" in w for w in m_empty.warnings))
+
+open_only = ledger([100])
+open_only["status"] = jr.OPEN
+open_only["realised_pts"] = np.nan
+m_open = jr.compute_metrics(open_only)
+check("open-only journal reports nothing closed", m_open.n_closed == 0)
+check("open-only journal explains why",
+      any("none closed" in w for w in m_open.warnings), str(m_open.warnings))
+
+# ---- persistence honesty -----------------------------------------------------------
+check("a memory store admits it is not durable", not jr.MemoryStore().durable)
+check("the memory store warns", jr.storage_warning(jr.MemoryStore()) != "")
+check("the warning names the real risk",
+      "wipes the filesystem" in jr.storage_warning(jr.MemoryStore()))
+
+
+class _FakeDurable:
+    durable = True
+    location = "/somewhere/real"
+
+
+check("a durable store produces no warning",
+      jr.storage_warning(_FakeDurable()) == "")
+
+_prev_env = _os.environ.pop("STREAMLIT_RUNTIME_ENV", None)
+check("no Streamlit markers means not detected as ephemeral",
+      jr.on_ephemeral_host() == _os.path.exists("/mount/src"))
+_os.environ["STREAMLIT_RUNTIME_ENV"] = "cloud"
+check("a Streamlit Cloud marker is detected as ephemeral", jr.on_ephemeral_host())
+check("a CSV store on an ephemeral host reports NOT durable",
+      not jr.CsvStore(_path).durable)
+_os.environ.pop("STREAMLIT_RUNTIME_ENV", None)
+if _prev_env is not None:
+    _os.environ["STREAMLIT_RUNTIME_ENV"] = _prev_env
+
+# ---- atomic write ------------------------------------------------------------------
+before = csv_store.load()
+check("a failed save leaves the previous file intact",
+      jr.CsvStore("/proc/nonexistent/journal.csv").save(before) is False
+      and len(csv_store.load()) == len(before))
+
+# ---- stale config --------------------------------------------------------------------
+_saved_j = {}
+for _name in list(jr._CFG_DEFAULTS):
+    if hasattr(config, _name):
+        _saved_j[_name] = getattr(config, _name)
+        delattr(config, _name)
+check("stale journal config is detected and named",
+      sorted(jr.config_health()) == sorted(_saved_j), str(jr.config_health()))
+check("metrics still compute on a stale config",
+      jr.compute_metrics(ledger([100, -50])).n_closed == 2)
+check("Wilson still computes on a stale config",
+      np.isfinite(jr.wilson_interval(5, 10)[0]))
+for _name, _val in _saved_j.items():
+    setattr(config, _name, _val)
+check("journal config restored", jr.config_health() == [])
+
+import shutil as _shutil  # noqa: E402
+_shutil.rmtree(_tmpdir, ignore_errors=True)
+
+
+# ==========================================================================
+print("\n[13] Data layer guards")
 # ==========================================================================
 import data_layer as dl  # noqa: E402
 
