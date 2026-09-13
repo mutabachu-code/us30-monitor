@@ -25,6 +25,7 @@ import streamlit as st
 import config
 import data_layer as dl
 import dow_attribution as attr
+import dow_options as options_mod
 import us30_macro as macro_mod
 import us30_micro as micro_mod
 import us30_regime as regime_mod
@@ -33,6 +34,28 @@ import us30_technicals as tech_mod
 import us30_master_signal as master
 
 st.set_page_config(page_title="US30 Monitor", page_icon="📉", layout="wide")
+
+# --------------------------------------------------------------------------
+# Deploy health check — runs before anything can crash on a stale constant
+# --------------------------------------------------------------------------
+# Streamlit Cloud deploys whatever is in the repo at that moment. A push that
+# lands a module before its config constants used to kill the app at import
+# time with a redacted AttributeError. Now the modules carry their own
+# fallbacks and this banner names exactly which file is behind.
+EXPECTED_CONFIG_VERSION = 3
+_stale = micro_mod.config_health() + options_mod.config_health()
+_version = getattr(config, "CONFIG_VERSION", 1)
+
+if _stale or _version < EXPECTED_CONFIG_VERSION:
+    st.warning(
+        f"**config.py looks stale** — it reports version {_version}, the code "
+        f"expects {EXPECTED_CONFIG_VERSION}."
+        + (f" Missing: `{'`, `'.join(_stale)}`." if _stale else "")
+        + " The app is running on built-in defaults, so nothing is broken, but "
+        "push the current `config.py` and reboot to pick up your real settings. "
+        "If you just pushed it, use **Manage app → Reboot** — a crashed app does "
+        "not reliably reload on the next commit."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -79,8 +102,9 @@ with st.sidebar:
     )
     st.divider()
     st.caption(
-        "**Not yet built:** L6 options (phase 5). Its ±10 budget is "
-        "redistributed across live layers rather than scored zero."
+        "**All seven layers built.** L6 options still reports unavailable when "
+        "component chain liquidity is too thin — that is designed behaviour, "
+        "and C6 redistributes its ±10 budget when it happens."
     )
     if st.button("Clear cache"):
         st.cache_data.clear()
@@ -122,9 +146,14 @@ with st.spinner("Loading engines..."):
         micro = micro_mod.MicroReport(note=f"microstructure crashed: {exc}")
 
     try:
+        options = options_mod.get_options(attribution)
+    except Exception as exc:  # noqa: BLE001
+        options = options_mod.OptionsReport(note=f"options crashed: {exc}")
+
+    try:
         signal = master.build_master_signal(
             attribution=attribution, technicals=technicals, macro=macro,
-            regime=regime, sectors=sectors, micro=micro,
+            regime=regime, sectors=sectors, micro=micro, options=options,
             ctx={"spread_pts": spread_pts, "slippage_pts": slippage_pts},
         )
     except Exception as exc:  # noqa: BLE001
@@ -411,6 +440,84 @@ def render_micro():
         st.caption(f"• {f}")
 
 
+@panel("Options")
+def render_options():
+    st.subheader("Options & gamma — component-weighted")
+    st.caption(
+        "Built from the top 8 names by price weight, not from DIA. DIA options "
+        "trade ~13.9k contracts/day against QQQ's ~1.53M, so a DIA-based gamma "
+        "engine reads a handful of institutional hedges rather than the market. "
+        "Those 8 names are roughly 48% of the index."
+    )
+
+    if not options.ok:
+        st.warning(options.note or "options layer unavailable")
+        for f in options.flags:
+            st.caption(f"• {f}")
+        if not options.table.empty:
+            st.dataframe(options.table, width="stretch")
+        st.info(
+            "L6 reporting unavailable is the designed behaviour when liquidity "
+            "is too thin — C6 redistributes its ±10 budget across the live "
+            "layers rather than scoring it zero."
+        )
+        return
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    tone = {"LONG_GAMMA": "🔵", "SHORT_GAMMA": "🔴", "NEUTRAL": "⚪"}.get(
+        options.gamma_regime, "⚪")
+    c1.metric("Gamma regime", f"{tone} {options.gamma_regime.replace('_', ' ').title()}",
+              f"{options.aggregate_gex:+.2f}")
+    c2.metric("Weight covered", f"{options.weight_covered * 100:.0f}%",
+              help="Share of total DJIA price weight with a usable chain")
+    c3.metric("Weighted PCR",
+              f"{options.weighted_pcr:.2f}" if np.isfinite(options.weighted_pcr) else "—")
+    c4.metric("Weighted skew",
+              f"{options.weighted_skew:+.3f}" if np.isfinite(options.weighted_skew) else "—",
+              help="10% OTM put IV minus 10% OTM call IV, price-weighted")
+    c5.metric("Expected move",
+              f"±{options.expected_move_pts:,.0f} pts"
+              if np.isfinite(options.expected_move_pts) else "—",
+              f"vol scalar {options.vol_scalar:.2f}×")
+
+    if options.gamma_regime == "LONG_GAMMA":
+        st.info(
+            "**Dealers long gamma.** Hedging sells strength and buys weakness, "
+            "which pins price and suppresses range. Breakout and continuation "
+            "setups underperform here — C11 downgrades them."
+        )
+    elif options.gamma_regime == "SHORT_GAMMA":
+        st.warning(
+            "**Dealers short gamma.** Hedging buys strength and sells weakness, "
+            "amplifying moves. Fading extremes is the wrong side of the flow — "
+            "C12 blocks mean-reversion entries."
+        )
+
+    st.markdown("**Per-name gamma ledger**")
+    st.dataframe(options.table, width="stretch")
+
+    x1, x2 = st.columns(2)
+    x1.metric("DIA net GEX (cross-check)",
+              f"${options.dia_net_gex / 1e6:,.1f}m"
+              if np.isfinite(options.dia_net_gex) else "—",
+              f"OI {options.dia_total_oi:,}")
+    x2.metric("DIA agrees with components",
+              {True: "yes", False: "no", None: "not usable"}[options.dia_agrees])
+
+    st.warning(
+        "**Two assumptions worth holding onto.** Dealer sign is a convention, "
+        "not data — nobody outside the clearing system observes which side "
+        "dealers are on, and this uses the standard dealers-long-calls, "
+        "short-puts convention. And yfinance ships no greeks, so gamma is "
+        "computed here from Black-Scholes using the chain's own implied "
+        "volatility, which is unreliable on thin strikes. Strikes outside "
+        f"±{float(getattr(config, 'OPTIONS_MONEYNESS_BAND', 0.15)) * 100:.0f}% "
+        "moneyness and names under the OI floor are dropped for that reason."
+    )
+    for f in options.flags:
+        st.caption(f"• {f}")
+
+
 @panel("Sectors")
 def render_sectors():
     st.subheader("Sector rotation — Dow-weighted")
@@ -436,8 +543,8 @@ def render_sectors():
 render_signal()
 st.divider()
 
-tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Macro",
-                "Regime", "Sectors", "Diagnostics"])
+tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Options",
+                "Macro", "Regime", "Sectors", "Diagnostics"])
 with tabs[0]:
     render_attribution()
 with tabs[1]:
@@ -445,17 +552,20 @@ with tabs[1]:
 with tabs[2]:
     render_micro()
 with tabs[3]:
-    render_macro()
+    render_options()
 with tabs[4]:
-    render_regime()
+    render_macro()
 with tabs[5]:
-    render_sectors()
+    render_regime()
 with tabs[6]:
+    render_sectors()
+with tabs[7]:
     st.subheader("Diagnostics")
     st.write({
         "attribution": attribution.note,
         "technicals": technicals.note,
         "microstructure": micro.note,
+        "options": options.note,
         "macro": macro.note,
         "regime": regime.note,
         "sectors": sectors.note,

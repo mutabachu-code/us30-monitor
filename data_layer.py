@@ -316,6 +316,68 @@ def get_sector_daily(period: str = "3mo") -> Fetch:
     return Fetch(data=df, ok=True, source="yfinance", note=f"{len(etfs)} ETFs")
 
 
+# --------------------------------------------------------------------------
+# Option chains
+# --------------------------------------------------------------------------
+@cache(config.TTL_OPTIONS)
+def get_option_chain(ticker: str, max_dte: int | None = None) -> dict:
+    """
+    Nearest usable expiry for one ticker.
+
+    yfinance returns impliedVolatility, openInterest, volume and bid/ask —
+    but NO greeks. Gamma is computed in dow_options from Black-Scholes; this
+    function only delivers clean inputs.
+
+    Returns a plain dict so it caches cleanly, never raises, and always carries
+    an `ok` flag plus a human-readable `note`.
+    """
+    out = {"ticker": ticker, "ok": False, "note": "", "expiry": "",
+           "calls": pd.DataFrame(), "puts": pd.DataFrame(), "spot": float("nan")}
+    if not HAVE_YF or breaker_open():
+        out["note"] = "yfinance unavailable or circuit breaker open"
+        return out
+
+    max_dte = config.OPTIONS_MAX_DTE if max_dte is None else max_dte
+    try:
+        tk = yf.Ticker(ticker)
+        expiries = list(tk.options or [])
+        if not expiries:
+            out["note"] = "no expiries listed"
+            _record(False)
+            return out
+
+        today = pd.Timestamp.utcnow().normalize().tz_localize(None)
+        chosen = ""
+        for exp in expiries:
+            dte = (pd.Timestamp(exp) - today).days
+            if 0 <= dte <= max_dte:
+                chosen = exp
+                break
+        if not chosen:
+            out["note"] = f"no expiry within {max_dte} days"
+            return out
+
+        chain = tk.option_chain(chosen)
+        calls = chain.calls.copy() if chain.calls is not None else pd.DataFrame()
+        puts = chain.puts.copy() if chain.puts is not None else pd.DataFrame()
+        if calls.empty and puts.empty:
+            out["note"] = f"empty chain for {chosen}"
+            _record(False)
+            return out
+
+        hist = tk.history(period="1d", interval="1d", auto_adjust=False)
+        spot = float(pd.to_numeric(hist["Close"], errors="coerce").dropna().iloc[-1]) \
+            if hist is not None and not hist.empty and "Close" in hist else float("nan")
+
+        out.update(ok=True, expiry=chosen, calls=calls, puts=puts, spot=spot,
+                   note=f"{chosen}: {len(calls)} calls / {len(puts)} puts")
+        _record(True)
+    except Exception as exc:  # noqa: BLE001
+        out["note"] = f"chain fetch failed: {str(exc)[:70]}"
+        _record(False)
+    return out
+
+
 @cache(config.TTL_DAILY)
 def get_cross_index(period: str = "3mo") -> Fetch:
     """NAS100 cash for the C8 cross-index conflict check."""

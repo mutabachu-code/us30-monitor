@@ -11,6 +11,12 @@ is what actually detects constituent changes. Never hard-code weights.
 
 from __future__ import annotations
 
+# Bumped whenever a phase ADDS constants. app.py compares this against what the
+# modules expect and names the stale file, instead of dying on a redacted
+# AttributeError before a single panel renders.
+#   1 = phases 0-3   2 = phase 4 (microstructure)   3 = phase 5 (options)
+CONFIG_VERSION = 3
+
 # ----------------------------------------------------------------------------
 # Constituents (seed list — verified 12 Sep 2026, post GOOGL/VZ swap of 29 Jun 2026)
 # ----------------------------------------------------------------------------
@@ -184,6 +190,31 @@ BASIS_MIN_SAMPLES = 20
 RTH_START = "09:30"
 RTH_END = "16:00"
 GLOBEX_START = "18:00"    # bars at or after this belong to the NEXT session
+
+# ----------------------------------------------------------------------------
+# Options (phase 5)
+# ----------------------------------------------------------------------------
+# DIA options trade ~13.9k contracts/day against QQQ's ~1.53M, and DJX index
+# options ~3.0k. Strike-level OI that thin produces gamma walls that move
+# around day to day, so the QQQ engine from mag7-monitor does NOT port here.
+# Instead: pull the top N names by PRICE weight, all of which have deep chains,
+# and weight each one's gamma by its DJIA point contribution. Those names are
+# roughly half the index, so aggregated component positioning is a truer read
+# on Dow dealer exposure than DIA itself.
+OPTIONS_TOP_N = 8
+OPTIONS_MIN_OI_PER_NAME = 2000      # total OI on the chosen expiry
+OPTIONS_MIN_WEIGHT_COVERED = 0.30   # below this the layer reports unavailable
+OPTIONS_MAX_DTE = 45                # ignore far-dated expiries
+OPTIONS_MIN_DTE_HOURS = 2.0         # T floor: gamma explodes as T -> 0
+OPTIONS_MONEYNESS_BAND = 0.15       # keep strikes within +/-15% of spot
+OPTIONS_SKEW_DELTA = 0.10           # skew measured at +/-10% moneyness
+DIA_THIN_OI = 50_000                # below this, the DIA cross-check is noise
+DEFAULT_RISK_FREE = 0.04            # fallback if ^IRX does not resolve
+
+# Gamma regime thresholds on the weight-normalised aggregate, range -1..+1.
+GAMMA_LONG_THRESHOLD = 0.15         # dealers long gamma  -> suppresses moves
+GAMMA_SHORT_THRESHOLD = -0.15       # dealers short gamma -> amplifies moves
+EXPECTED_MOVE_EXHAUSTION = 0.95     # today's move vs expected move
 
 # Time-of-day blocks (US/Eastern). Score the same setup differently by block.
 SESSION_BLOCKS = [

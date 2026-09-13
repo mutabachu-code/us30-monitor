@@ -550,7 +550,579 @@ check("no inputs at all degrades safely",
 
 
 # ==========================================================================
-print("\n[9] Data layer guards")
+print("\n[9] Microstructure — phase 4")
+# ==========================================================================
+import us30_micro as micro_mod  # noqa: E402
+
+TZ = config.MARKET_TZ
+
+
+def bars_for(day: str, start: str, n: int, base: float, step: float = 0.0,
+             rng_pts: float = 20.0, vol: float = 1000.0,
+             close_pos: float = 0.5, freq: str = "5min") -> pd.DataFrame:
+    """Build n bars with a known range and a known close position inside it."""
+    idx = pd.date_range(f"{day} {start}", periods=n, freq=freq, tz=TZ)
+    mid = base + np.arange(n) * step
+    low = mid - rng_pts / 2
+    high = mid + rng_pts / 2
+    close = low + (high - low) * close_pos
+    return pd.DataFrame({"Open": mid, "High": high, "Low": low,
+                         "Close": close, "Volume": np.full(n, vol)}, index=idx)
+
+
+# ---- session boundary: Globex 18:00 belongs to the NEXT session -----------
+mixed = pd.DatetimeIndex([
+    pd.Timestamp("2026-09-08 17:00", tz=TZ),   # Tue RTH-ish -> Tue
+    pd.Timestamp("2026-09-08 18:05", tz=TZ),   # Tue Globex  -> Wed
+    pd.Timestamp("2026-09-09 03:00", tz=TZ),   # Wed o/n     -> Wed
+    pd.Timestamp("2026-09-09 10:00", tz=TZ),   # Wed RTH     -> Wed
+    pd.Timestamp("2026-09-06 20:00", tz=TZ),   # Sunday eve  -> Monday 7th? no, 7th is Mon
+])
+sd = micro_mod.session_dates(mixed)
+check("17:00 bar stays in its own session",
+      sd.iloc[0] == pd.Timestamp("2026-09-08"), str(sd.iloc[0]))
+check("18:05 Globex bar rolls to the next session",
+      sd.iloc[1] == pd.Timestamp("2026-09-09"), str(sd.iloc[1]))
+check("overnight 03:00 bar belongs to that day's session",
+      sd.iloc[2] == pd.Timestamp("2026-09-09"), str(sd.iloc[2]))
+check("Sunday-evening bar rolls forward to Monday",
+      sd.iloc[4].dayofweek == 0, f"{sd.iloc[4]} dow={sd.iloc[4].dayofweek}")
+
+rth = micro_mod.rth_mask(pd.DatetimeIndex([
+    pd.Timestamp("2026-09-09 09:29", tz=TZ),
+    pd.Timestamp("2026-09-09 09:30", tz=TZ),
+    pd.Timestamp("2026-09-09 15:59", tz=TZ),
+    pd.Timestamp("2026-09-09 16:00", tz=TZ),
+    pd.Timestamp("2026-09-12 11:00", tz=TZ),   # Saturday
+]))
+check("RTH mask boundaries are correct",
+      list(rth) == [False, True, True, False, False], str(list(rth)))
+
+naive = pd.DataFrame({"Open": [1.0], "High": [1.0], "Low": [1.0],
+                      "Close": [1.0], "Volume": [1.0]},
+                     index=pd.DatetimeIndex(["2026-09-09 14:00"]))
+check("naive timestamps are localised, not dropped",
+      micro_mod.to_et(naive).index.tz is not None)
+
+# ---- RVOL is same-time-of-day, not a flat average -------------------------
+# Three quiet sessions, then today with a 3x spike at ONE slot only.
+hist = pd.concat([
+    bars_for("2026-09-08", "09:30", 12, 52000, vol=1000),
+    bars_for("2026-09-09", "09:30", 12, 52000, vol=1000),
+    bars_for("2026-09-10", "09:30", 12, 52000, vol=1000),
+])
+today_spike = bars_for("2026-09-11", "09:30", 12, 52000, vol=1000)
+today_spike.iloc[-1, today_spike.columns.get_loc("Volume")] = 3000.0
+rv, rv_series = micro_mod.compute_rvol(pd.concat([hist, today_spike]))
+check("RVOL detects a 3x same-slot spike", close_to(rv, 3.0, 0.01), f"got {rv}")
+
+# The open being naturally heavy must NOT read as a spike.
+shaped = []
+for day in ("2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"):
+    b = bars_for(day, "09:30", 12, 52000, vol=1000)
+    b.iloc[0, b.columns.get_loc("Volume")] = 8000.0      # every open is heavy
+    shaped.append(b)
+rv_shaped, _ = micro_mod.compute_rvol(pd.concat(shaped))
+check("a structurally heavy open does not read as expansion",
+      close_to(rv_shaped, 1.0, 0.01),
+      f"got {rv_shaped} — a flat-average RVOL would have said ~8x here")
+
+check("RVOL needs two sessions",
+      not np.isfinite(micro_mod.compute_rvol(
+          bars_for("2026-09-11", "09:30", 12, 52000))[0]))
+
+# ---- delta proxy ----------------------------------------------------------
+strong_up = bars_for("2026-09-11", "09:30", 20, 52000, step=5, close_pos=1.0)
+cum_up, slope_up, series_up = micro_mod.compute_delta(strong_up)
+check("closes at the high give maximum positive delta",
+      close_to(cum_up, 20 * 1000.0, 1e-6), f"got {cum_up}")
+check("delta slope positive on buying pressure", slope_up > 0)
+
+strong_dn = bars_for("2026-09-11", "09:30", 20, 52000, step=-5, close_pos=0.0)
+check("closes at the low give maximum negative delta",
+      close_to(micro_mod.compute_delta(strong_dn)[0], -20 * 1000.0, 1e-6))
+
+mid = bars_for("2026-09-11", "09:30", 20, 52000, close_pos=0.5)
+check("mid-range closes contribute zero delta",
+      close_to(micro_mod.compute_delta(mid)[0], 0.0, 1e-6))
+
+# Zero-range bars must not divide by zero.
+flat = bars_for("2026-09-11", "09:30", 10, 52000, rng_pts=0.0)
+cum_flat, _, _ = micro_mod.compute_delta(flat)
+check("zero-range bars are handled without NaN/inf",
+      np.isfinite(cum_flat) and close_to(cum_flat, 0.0, 1e-6), f"got {cum_flat}")
+
+# Divergence: price makes a higher high late, delta does not follow.
+first_half = bars_for("2026-09-11", "09:30", 14, 52000, step=8, close_pos=1.0)
+second_half = bars_for("2026-09-11", "10:40", 14, 52150, step=6, close_pos=0.15)
+div_bars = pd.concat([first_half, second_half])
+_, _, div_series = micro_mod.compute_delta(div_bars)
+check("delta divergence detected on an unconfirmed new high",
+      micro_mod.delta_divergence(div_bars, div_series) == "bearish",
+      micro_mod.delta_divergence(div_bars, div_series))
+
+# ---- levels ---------------------------------------------------------------
+overnight = bars_for("2026-09-11", "04:00", 30, 52000, rng_pts=40)   # o/n range
+session = bars_for("2026-09-11", "09:30", 30, 52200, step=2, rng_pts=20)
+prior = bars_for("2026-09-10", "09:30", 40, 51800, rng_pts=60)
+level_bars = pd.concat([prior, overnight, session])
+lv = micro_mod.compute_levels(level_bars, float(session["Close"].iloc[-1]))
+check("overnight high captured", close_to(lv.overnight_high, 52020.0, 0.01),
+      f"got {lv.overnight_high}")
+check("overnight low captured", close_to(lv.overnight_low, 51980.0, 0.01))
+check("prior-day high captured", close_to(lv.prior_high, 51830.0, 0.01),
+      f"got {lv.prior_high}")
+check("initial balance is the first 60 RTH minutes only",
+      np.isfinite(lv.ib_high) and lv.ib_high < float(session["High"].max()),
+      f"ib_high={lv.ib_high} session_high={session['High'].max()}")
+check("price above the overnight range sets ABOVE_ON",
+      lv.state == "ABOVE_ON", lv.state)
+check("range position above 1 when price clears the overnight high",
+      lv.on_range_position > 1.0, f"{lv.on_range_position}")
+
+# ---- sweeps: rejection is what separates a sweep from a breakout ----------
+base_bars = bars_for("2026-09-11", "09:30", 40, 52000, rng_pts=20, vol=1000)
+sweep_levels = micro_mod.Levels(overnight_high=52010.0, overnight_low=51990.0)
+
+# A bar that pokes above the level and closes back WELL below it = sweep.
+rejected = base_bars.copy()
+i = len(rejected) - 2
+rejected.iloc[i, rejected.columns.get_loc("High")] = 52080.0
+rejected.iloc[i, rejected.columns.get_loc("Low")] = 51980.0
+rejected.iloc[i, rejected.columns.get_loc("Close")] = 51995.0
+sweeps = micro_mod.detect_sweeps(rejected, sweep_levels, atr_val=40.0)
+check("rejected penetration is detected as a sweep",
+      any(s.side == "high" for s in sweeps), str(sweeps))
+check("a high sweep implies bearish",
+      all(s.implication == "bearish" for s in sweeps if s.side == "high"))
+
+# A bar that breaks the level and HOLDS above it = breakout, not a sweep.
+held = base_bars.copy()
+held.iloc[i, held.columns.get_loc("High")] = 52080.0
+held.iloc[i, held.columns.get_loc("Low")] = 52020.0
+held.iloc[i, held.columns.get_loc("Close")] = 52075.0
+check("a level that breaks and holds is NOT a sweep",
+      not any(s.side == "high" for s in
+              micro_mod.detect_sweeps(held, sweep_levels, atr_val=40.0)),
+      str(micro_mod.detect_sweeps(held, sweep_levels, atr_val=40.0)))
+
+# A touch without real penetration is not a sweep either.
+touched = base_bars.copy()
+touched.iloc[i, touched.columns.get_loc("High")] = 52010.5
+touched.iloc[i, touched.columns.get_loc("Close")] = 51995.0
+check("a mere touch of the level is not a sweep",
+      not any(s.side == "high" for s in
+              micro_mod.detect_sweeps(touched, sweep_levels, atr_val=40.0)))
+
+# Low sweep.
+low_swept = base_bars.copy()
+low_swept.iloc[i, low_swept.columns.get_loc("Low")] = 51920.0
+low_swept.iloc[i, low_swept.columns.get_loc("High")] = 52020.0
+low_swept.iloc[i, low_swept.columns.get_loc("Close")] = 52005.0
+low_sweeps = micro_mod.detect_sweeps(low_swept, sweep_levels, atr_val=40.0)
+check("low sweep detected and implies bullish",
+      any(s.side == "low" and s.implication == "bullish" for s in low_sweeps),
+      str(low_sweeps))
+
+# ---- basis ----------------------------------------------------------------
+fut_rth = bars_for("2026-09-11", "09:30", 40, 52050, rng_pts=10)
+cash_rth = bars_for("2026-09-11", "09:30", 40, 52000, rng_pts=10)
+b_val, b_mean, b_std, b_sigma, b_ok = micro_mod.compute_basis(fut_rth, cash_rth)
+check("basis computed during RTH", b_ok)
+check("constant 50pt basis measured correctly", close_to(b_val, 50.0, 1e-6),
+      f"got {b_val}")
+
+# Dislocate the last bar by a large amount -> large sigma.
+fut_disloc = fut_rth.copy()
+fut_disloc.iloc[:-1, fut_disloc.columns.get_loc("Close")] += np.linspace(-3, 3, 39)
+fut_disloc.iloc[-1, fut_disloc.columns.get_loc("Close")] += 40.0
+_, _, _, sigma_d, _ = micro_mod.compute_basis(fut_disloc, cash_rth)
+check("a dislocated basis produces a large sigma", abs(sigma_d) > 2.0,
+      f"got {sigma_d}")
+
+# Overnight bars only -> basis must be unavailable, not wrong.
+fut_on = bars_for("2026-09-11", "03:00", 40, 52050)
+cash_on = bars_for("2026-09-11", "03:00", 40, 52000)
+check("basis is unavailable outside RTH rather than misleading",
+      not micro_mod.compute_basis(fut_on, cash_on)[4])
+
+# ---- end-to-end -----------------------------------------------------------
+full = pd.concat([
+    bars_for("2026-09-09", "09:30", 78, 51900, rng_pts=25, vol=1000),
+    bars_for("2026-09-10", "09:30", 78, 51950, rng_pts=25, vol=1000),
+    bars_for("2026-09-11", "04:00", 66, 52000, rng_pts=30, vol=400),
+    bars_for("2026-09-11", "09:30", 40, 52100, step=3, rng_pts=25,
+             vol=2000, close_pos=0.9),
+])
+cash_full = bars_for("2026-09-11", "09:30", 40, 52050, step=3, rng_pts=25)
+m = micro_mod.compute_micro(full, cash_full, spread_pts=4.0, slippage_pts=2.0)
+check("micro ok end to end", m.ok, m.note)
+check("micro score inside ±15", abs(m.score) <= 15.0 + 1e-9, f"{m.score}")
+check("round-trip cost is spread + slippage",
+      close_to(m.round_trip_cost, 6.0, 1e-9))
+check("minimum viable target is 3x cost",
+      close_to(m.min_viable_target, 18.0, 1e-9))
+check("strong buying with volume expansion scores positive", m.score > 0,
+      f"{m.score} rvol={m.rvol} state={m.levels.state}")
+check("confidence in a sane band", 0.0 <= m.confidence <= 1.0)
+
+m_empty = micro_mod.compute_micro(pd.DataFrame())
+check("empty bars degrade safely", not m_empty.ok and m_empty.score == 0.0)
+m_short = micro_mod.compute_micro(bars_for("2026-09-11", "09:30", 5, 52000))
+check("too few bars degrades safely", not m_short.ok, m_short.note)
+
+# ---- C7 now has data ------------------------------------------------------
+sig_basis = master.build_master_signal(
+    attribution=Stub(22), technicals=Stub(18, price=52000, atr14=400),
+    regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(5, basis_sigma=3.4),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C7 fires on a dislocated basis",
+      any(c.code == "C7" for c in sig_basis.conflicts),
+      str([c.code for c in sig_basis.conflicts]))
+check("C7 blocks entry", sig_basis.blocked)
+
+sig_nobasis = master.build_master_signal(
+    attribution=Stub(22), technicals=Stub(18, price=52000, atr14=400),
+    regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(5, basis_sigma=float("nan")),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C7 stays silent when the basis is NaN",
+      not any(c.code == "C7" for c in sig_nobasis.conflicts),
+      str([c.code for c in sig_nobasis.conflicts]))
+
+# ---- stale-config tolerance -----------------------------------------------
+# Simulate the exact failure that killed the live app: config.py without the
+# phase-4 constants, while us30_micro.py is already deployed.
+_saved = {}
+for _name in list(micro_mod._CFG_DEFAULTS):
+    if hasattr(config, _name):
+        _saved[_name] = getattr(config, _name)
+        delattr(config, _name)
+
+check("stale config is detected and named",
+      sorted(micro_mod.config_health()) == sorted(_saved),
+      str(micro_mod.config_health()))
+check("session_dates still works on a stale config",
+      micro_mod.session_dates(pd.DatetimeIndex(
+          [pd.Timestamp("2026-09-08 18:05", tz=TZ)])).iloc[0]
+      == pd.Timestamp("2026-09-09"))
+m_stale = micro_mod.compute_micro(full, cash_full)
+check("compute_micro still runs on a stale config", m_stale.ok, m_stale.note)
+check("stale-config result matches the real-config result",
+      close_to(m_stale.score, m.score, 1e-9),
+      f"stale={m_stale.score} real={m.score}")
+
+for _name, _val in _saved.items():
+    setattr(config, _name, _val)
+check("config restored after the stale-config test",
+      micro_mod.config_health() == [])
+
+# ---- coverage rises to 90% with L3 live -----------------------------------
+sig_p4 = master.build_master_signal(
+    attribution=Stub(20), technicals=Stub(16), macro=Stub(12),
+    regime=Stub(8), sectors=Stub(4), micro=Stub(12), options=None,
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("coverage is 90% with only L6 missing",
+      close_to(sig_p4.coverage, 0.90, 1e-9), f"{sig_p4.coverage}")
+
+
+# ==========================================================================
+print("\n[10] Options — phase 5")
+# ==========================================================================
+import dow_options as opt  # noqa: E402
+
+# ---- Black-Scholes, validated against numerical derivatives ---------------
+check("norm_cdf(0) is 0.5", close_to(float(opt.norm_cdf(0.0)), 0.5, 1e-12))
+check("norm_cdf is symmetric",
+      close_to(float(opt.norm_cdf(1.3)) + float(opt.norm_cdf(-1.3)), 1.0, 1e-12))
+check("norm_pdf(0) is 1/sqrt(2pi)",
+      close_to(float(opt.norm_pdf(0.0)), 1 / np.sqrt(2 * np.pi), 1e-12))
+
+# THE test that matters: analytic gamma must equal the numerical second
+# derivative of the BS price. A wrong d1, a missing sqrt(T) or a stray spot
+# term all survive eyeballing and die here.
+for S, K, T, V, R in [(100, 100, 1.0, 0.20, 0.0), (100, 110, 0.5, 0.35, 0.04),
+                      (1037, 1000, 0.08, 0.28, 0.04), (52, 55, 0.25, 0.15, 0.02)]:
+    h = S * 1e-4
+    for is_call in (True, False):
+        num = (float(opt.bs_price(S + h, K, T, V, R, is_call))
+               - 2 * float(opt.bs_price(S, K, T, V, R, is_call))
+               + float(opt.bs_price(S - h, K, T, V, R, is_call))) / (h * h)
+        ana = float(opt.bs_gamma(S, K, T, V, R))
+        check(f"gamma matches finite differences S={S} K={K} "
+              f"{'call' if is_call else 'put'}",
+              abs(num - ana) < max(1e-6, abs(ana) * 1e-3),
+              f"analytic={ana:.8f} numerical={num:.8f}")
+
+check("call and put gamma are identical",
+      close_to(float(opt.bs_gamma(100, 105, 0.5, 0.3, 0.03)),
+               float(opt.bs_gamma(100, 105, 0.5, 0.3, 0.03)), 1e-15))
+check("put-call parity holds",
+      close_to(float(opt.bs_price(100, 95, 1.0, 0.25, 0.05, True))
+               - float(opt.bs_price(100, 95, 1.0, 0.25, 0.05, False)),
+               100 - 95 * np.exp(-0.05), 1e-8))
+check("ATM gamma exceeds far-OTM gamma",
+      float(opt.bs_gamma(100, 100, 0.25, 0.2)) > float(opt.bs_gamma(100, 140, 0.25, 0.2)))
+check("zero time to expiry yields zero, not inf",
+      float(opt.bs_gamma(100, 100, 0.0, 0.2)) == 0.0)
+check("zero vol yields zero, not inf",
+      float(opt.bs_gamma(100, 100, 1.0, 0.0)) == 0.0)
+
+
+# ---- chain fixtures --------------------------------------------------------
+def make_chain(spot: float, expiry: str, call_oi: float, put_oi: float,
+               iv: float = 0.25, n: int = 11, put_iv_bump: float = 0.0) -> dict:
+    strikes = np.linspace(spot * 0.90, spot * 1.10, n)
+    calls = pd.DataFrame({"strike": strikes, "impliedVolatility": np.full(n, iv),
+                          "openInterest": np.full(n, call_oi / n),
+                          "volume": np.full(n, 10.0)})
+    puts = pd.DataFrame({"strike": strikes,
+                         "impliedVolatility": np.full(n, iv + put_iv_bump),
+                         "openInterest": np.full(n, put_oi / n),
+                         "volume": np.full(n, 10.0)})
+    return {"ticker": "X", "ok": True, "note": "", "expiry": expiry,
+            "calls": calls, "puts": puts, "spot": spot}
+
+
+NOW = pd.Timestamp("2026-09-13 12:00")
+EXP = "2026-09-25"
+
+# Call-heavy chain -> dealers long gamma -> positive net GEX.
+ng_long = opt.compute_name_gamma("GS", make_chain(1000, EXP, 60000, 10000),
+                                 1000.0, 11.7, 61.7, rate=0.04, now=NOW)
+check("call-heavy chain is liquid and parsed", ng_long.liquid, ng_long.note)
+check("call-heavy chain gives positive net GEX", ng_long.net_gex > 0,
+      f"{ng_long.net_gex:,.0f}")
+check("PCR below 1 on a call-heavy chain", ng_long.pcr < 1.0, f"{ng_long.pcr}")
+
+ng_short = opt.compute_name_gamma("GS", make_chain(1000, EXP, 10000, 60000),
+                                  1000.0, 11.7, 61.7, rate=0.04, now=NOW)
+check("put-heavy chain gives negative net GEX", ng_short.net_gex < 0,
+      f"{ng_short.net_gex:,.0f}")
+check("PCR above 1 on a put-heavy chain", ng_short.pcr > 1.0, f"{ng_short.pcr}")
+check("net GEX is call GEX minus put GEX",
+      close_to(ng_short.net_gex, ng_short.call_gex - ng_short.put_gex, 1e-6))
+
+# Skew: richer puts than calls must produce a positive skew reading.
+ng_skew = opt.compute_name_gamma("GS", make_chain(1000, EXP, 30000, 30000,
+                                                  put_iv_bump=0.05),
+                                 1000.0, 11.7, 61.7, rate=0.04, now=NOW)
+check("richer put IV produces positive skew", ng_skew.iv_skew > 0.04,
+      f"{ng_skew.iv_skew}")
+
+# Expected move converts to DJIA points through pts_per_1pct.
+check("expected move is expressed in DJIA points",
+      np.isfinite(ng_long.expected_move_pts)
+      and close_to(ng_long.expected_move_pts,
+                   ng_long.expected_move_pct * 61.7, 1e-6),
+      f"{ng_long.expected_move_pts}")
+check("expected move is positive and sane",
+      0 < ng_long.expected_move_pct < 20, f"{ng_long.expected_move_pct}")
+
+# Gamma wall lands on a real strike.
+check("gamma wall is one of the chain's strikes",
+      np.isfinite(ng_long.gamma_wall)
+      and abs(ng_long.gamma_wall - 1000.0) <= 100.0, f"{ng_long.gamma_wall}")
+
+# ---- liquidity floor drops a name entirely --------------------------------
+ng_thin = opt.compute_name_gamma("NKE", make_chain(37, EXP, 200, 200),
+                                 37.0, 0.42, 2.2, rate=0.04, now=NOW)
+check("a chain under the OI floor is excluded", not ng_thin.liquid, ng_thin.note)
+check("excluded name says why", "below floor" in ng_thin.note, ng_thin.note)
+
+ng_nochain = opt.compute_name_gamma("BA", {"ok": False, "note": "no expiries listed"},
+                                    208.0, 2.36, 12.4, now=NOW)
+check("a missing chain degrades safely", not ng_nochain.liquid)
+
+# Strikes far outside the moneyness band are ignored.
+wide = make_chain(1000, EXP, 60000, 10000, n=11)
+wide["calls"].loc[0, "strike"] = 300.0        # 70% OTM, junk IV territory
+ng_wide = opt.compute_name_gamma("GS", wide, 1000.0, 11.7, 61.7, rate=0.04, now=NOW)
+check("out-of-band strikes are excluded from OI",
+      ng_wide.call_oi < ng_long.call_oi, f"{ng_wide.call_oi} vs {ng_long.call_oi}")
+
+# ---- aggregation -----------------------------------------------------------
+def name(t, w, pts, gex_per_pct, pcr=1.0, skew=0.0, move=50.0, liquid=True):
+    n = opt.NameGamma(ticker=t, spot=100.0, weight_pct=w, pts_per_1pct=pts)
+    n.gex_per_pct, n.pcr, n.iv_skew = gex_per_pct, pcr, skew
+    n.expected_move_pts, n.liquid, n.net_gex = move, liquid, gex_per_pct * 1e6
+    n.expiry, n.dte = EXP, 12.0
+    return n
+
+agg_long = opt.aggregate([name("GS", 11.7, 61.7, 0.004),
+                          name("CAT", 9.2, 48.7, 0.003),
+                          name("MSFT", 5.6, 29.6, 0.003),
+                          name("UNH", 4.4, 23.1, 0.002)], 30.9)
+check("aggregate ok with good coverage", agg_long.ok, agg_long.note)
+check("positive component GEX reads LONG_GAMMA",
+      agg_long.gamma_regime == "LONG_GAMMA", agg_long.gamma_regime)
+check("long gamma sets a suppressive vol scalar", agg_long.vol_scalar < 1.0)
+check("aggregate is clipped to ±1", abs(agg_long.aggregate_gex) <= 1.0)
+
+agg_short = opt.aggregate([name("GS", 11.7, 61.7, -0.004),
+                           name("CAT", 9.2, 48.7, -0.003),
+                           name("MSFT", 5.6, 29.6, -0.003),
+                           name("UNH", 4.4, 23.1, -0.002)], 30.9)
+check("negative component GEX reads SHORT_GAMMA",
+      agg_short.gamma_regime == "SHORT_GAMMA", agg_short.gamma_regime)
+check("short gamma sets an amplifying vol scalar", agg_short.vol_scalar > 1.0)
+
+# Heavier-weight names must move the aggregate more than light ones.
+heavy_pos = opt.aggregate([name("GS", 11.7, 61.7, 0.004),
+                           name("NKE", 0.42, 2.2, -0.004),
+                           name("CAT", 9.2, 48.7, 0.001),
+                           name("MSFT", 5.6, 29.6, 0.001)], 26.9)
+check("price weight dominates the aggregate, not name count",
+      heavy_pos.aggregate_gex > 0, f"{heavy_pos.aggregate_gex}")
+
+# ---- the liquidity gate is the whole point of this design ------------------
+agg_thin = opt.aggregate([name("GS", 11.7, 61.7, 0.004, liquid=False),
+                          name("CAT", 9.2, 48.7, 0.003, liquid=False),
+                          name("MSFT", 5.6, 29.6, 0.003, liquid=False),
+                          name("UNH", 4.4, 23.1, 0.002, liquid=True)], 30.9)
+check("coverage below the floor reports NOT ok", not agg_thin.ok,
+      f"covered={agg_thin.weight_covered:.3f}")
+check("thin coverage explains itself",
+      any("floor" in f for f in agg_thin.flags), str(agg_thin.flags))
+check("a not-ok options report still exposes its table",
+      not agg_thin.table.empty)
+
+agg_none = opt.aggregate([], 0.0)
+check("no names at all degrades safely",
+      not agg_none.ok and agg_none.score == 0.0)
+
+# DIA cross-check is ignored when its OI is thin.
+agg_dia_thin = opt.aggregate([name("GS", 11.7, 61.7, 0.004),
+                              name("CAT", 9.2, 48.7, 0.003),
+                              name("MSFT", 5.6, 29.6, 0.003),
+                              name("UNH", 4.4, 23.1, 0.002)], 30.9,
+                             dia_net_gex=-5e6, dia_total_oi=1200)
+check("thin DIA cross-check is discarded, not used",
+      agg_dia_thin.dia_agrees is None, str(agg_dia_thin.dia_agrees))
+check("discarded DIA check says why",
+      any("DIA cross-check ignored" in f for f in agg_dia_thin.flags),
+      str(agg_dia_thin.flags))
+
+agg_dia_ok = opt.aggregate([name("GS", 11.7, 61.7, 0.004),
+                            name("CAT", 9.2, 48.7, 0.003),
+                            name("MSFT", 5.6, 29.6, 0.003),
+                            name("UNH", 4.4, 23.1, 0.002)], 30.9,
+                           dia_net_gex=8e6, dia_total_oi=120_000)
+check("a liquid DIA check that agrees is recorded",
+      agg_dia_ok.dia_agrees is True)
+
+# ---- directional score comes from skew and PCR, never from gamma ----------
+agg_puts_rich = opt.aggregate([name("GS", 11.7, 61.7, 0.001, skew=0.08),
+                               name("CAT", 9.2, 48.7, 0.001, skew=0.08),
+                               name("MSFT", 5.6, 29.6, 0.001, skew=0.08),
+                               name("UNH", 4.4, 23.1, 0.001, skew=0.08)], 30.9)
+check("rich put skew scores bearish", agg_puts_rich.score < 0,
+      f"{agg_puts_rich.score}")
+check("options score inside ±10", abs(agg_puts_rich.score) <= 10.0 + 1e-9)
+
+agg_flat = opt.aggregate([name("GS", 11.7, 61.7, 0.004, skew=0.0, pcr=1.0),
+                          name("CAT", 9.2, 48.7, 0.004, skew=0.0, pcr=1.0),
+                          name("MSFT", 5.6, 29.6, 0.004, skew=0.0, pcr=1.0),
+                          name("UNH", 4.4, 23.1, 0.004, skew=0.0, pcr=1.0)], 30.9)
+check("strong gamma with neutral skew scores ~0 directionally",
+      abs(agg_flat.score) < 1.0, f"{agg_flat.score}")
+check("...but still reports a gamma regime",
+      agg_flat.gamma_regime == "LONG_GAMMA")
+
+# ---- C11 / C12 / C13 -------------------------------------------------------
+class Lv:
+    def __init__(self, state):
+        self.state = state
+
+
+sig_c11 = master.build_master_signal(
+    attribution=Stub(22, index_change_pts=80.0),
+    technicals=Stub(18, price=52000, atr14=400, mean_reversion="none"),
+    regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(6, levels=Lv("ABOVE_ON"), basis_sigma=float("nan")),
+    options=Stub(1, gamma_regime="LONG_GAMMA", aggregate_gex=0.6,
+                 vol_scalar=0.85, expected_move_pts=600.0),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C11 downgrades a breakout into long gamma",
+      any(c.code == "C11" for c in sig_c11.conflicts),
+      str([c.code for c in sig_c11.conflicts]))
+
+sig_c12 = master.build_master_signal(
+    attribution=Stub(-22, index_change_pts=-80.0),
+    technicals=Stub(-18, price=52000, atr14=400, mean_reversion="long_setup"),
+    regime=Stub(-8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(-6, levels=Lv("BELOW_ON"), basis_sigma=float("nan")),
+    options=Stub(-1, gamma_regime="SHORT_GAMMA", aggregate_gex=-0.6,
+                 vol_scalar=1.15, expected_move_pts=600.0),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C12 blocks fading a short-gamma tape",
+      any(c.code == "C12" for c in sig_c12.conflicts) and sig_c12.blocked,
+      str([c.code for c in sig_c12.conflicts]))
+
+sig_c13 = master.build_master_signal(
+    attribution=Stub(22, index_change_pts=580.0),
+    technicals=Stub(18, price=52000, atr14=400, mean_reversion="none"),
+    regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(6, levels=Lv("INSIDE_ON"), basis_sigma=float("nan")),
+    options=Stub(1, gamma_regime="NEUTRAL", aggregate_gex=0.0,
+                 vol_scalar=1.0, expected_move_pts=600.0),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C13 blocks once the expected move is spent",
+      any(c.code == "C13" for c in sig_c13.conflicts) and sig_c13.blocked,
+      str([c.code for c in sig_c13.conflicts]))
+
+sig_c13_room = master.build_master_signal(
+    attribution=Stub(22, index_change_pts=120.0),
+    technicals=Stub(18, price=52000, atr14=400, mean_reversion="none"),
+    regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+    micro=Stub(6, levels=Lv("INSIDE_ON"), basis_sigma=float("nan")),
+    options=Stub(1, gamma_regime="NEUTRAL", aggregate_gex=0.0,
+                 vol_scalar=1.0, expected_move_pts=600.0),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("C13 stays silent with room left in the expected move",
+      not any(c.code == "C13" for c in sig_c13_room.conflicts))
+
+check("gamma vol scalar reaches the master signal's confidence",
+      sig_c11.confidence < sig_c13_room.confidence,
+      f"{sig_c11.confidence:.3f} vs {sig_c13_room.confidence:.3f}")
+
+# ---- full coverage at last -------------------------------------------------
+sig_full = master.build_master_signal(
+    attribution=Stub(20), technicals=Stub(16), macro=Stub(12), regime=Stub(8),
+    sectors=Stub(4), micro=Stub(12), options=Stub(8),
+    ctx={"now": pd.Timestamp("2026-09-11 14:00", tz=TZ).to_pydatetime()},
+)
+check("all seven layers live gives 100% coverage",
+      close_to(sig_full.coverage, 1.0, 1e-9), f"{sig_full.coverage}")
+
+# ---- stale config ----------------------------------------------------------
+_saved_o = {}
+for _name in list(opt._CFG_DEFAULTS):
+    if hasattr(config, _name):
+        _saved_o[_name] = getattr(config, _name)
+        delattr(config, _name)
+check("stale options config is detected and named",
+      sorted(opt.config_health()) == sorted(_saved_o), str(opt.config_health()))
+ng_stale = opt.compute_name_gamma("GS", make_chain(1000, EXP, 60000, 10000),
+                                  1000.0, 11.7, 61.7, rate=0.04, now=NOW)
+check("options still compute on a stale config", ng_stale.liquid, ng_stale.note)
+check("stale-config gamma matches real-config gamma",
+      close_to(ng_stale.net_gex, ng_long.net_gex, 1e-6))
+for _name, _val in _saved_o.items():
+    setattr(config, _name, _val)
+check("options config restored", opt.config_health() == [])
+
+
+# ==========================================================================
+print("\n[11] Data layer guards")
 # ==========================================================================
 import data_layer as dl  # noqa: E402
 

@@ -16,8 +16,18 @@ streamlit run app.py
 ```
 
 Streamlit Cloud: point the app at `app.py` in the repo root. Push every changed
-file in one commit — a partial deploy is what causes the crash-on-startup you
-have hit before.
+file in one commit.
+
+**If the app shows a redacted `AttributeError` on a constant:** that is a
+partial deploy — a module landed before its config constants. Since phase 4 the
+modules carry their own fallbacks so this no longer kills the app; you get a
+banner naming the missing constants instead. If you already pushed the current
+`config.py` and still see the error, the app crashed on the earlier commit and
+did not reload: **Manage app → Reboot app**. A crashed Streamlit app does not
+reliably pick up the next push.
+
+`CONFIG_VERSION` in `config.py` is bumped whenever a phase adds constants, and
+`app.py` compares it against what the code expects.
 
 ---
 
@@ -37,7 +47,7 @@ trusting any panel. Its output will revise some assumptions.
 The synthetic suite covers the part that breaks quietly — the maths:
 
 ```bash
-python tests_synthetic.py       # 112 checks, no network required
+python tests_synthetic.py       # 217 checks, no network required
 ```
 
 ---
@@ -73,8 +83,11 @@ index anyway. There is a test for exactly this.
 **2. Options liquidity.** DIA options trade ~13.9k contracts/day against QQQ's
 ~1.53M; DJX index options ~3.0k. The QQQ GEX engine from `mag7-monitor` does
 **not** port to DIA — strike-level OI is too thin for stable gamma walls.
-Phase 5 builds it component-weighted across the top 8 liquid chains instead.
-L6's budget is 10, not the NAS100 build's 19, on that evidence.
+`dow_options.py` instead reads the top 8 names by price weight (~48% of the
+index), all of which have deep chains, and weights each one's gamma by its DJIA
+point contribution. DIA is fetched only as a cross-check and is discarded when
+its OI is under 50k. L6's budget is 10, not the NAS100 build's 19, on that
+evidence.
 
 **3. The MT5 point trap.** On MT5, a "point" is a *per-symbol* property. The
 USTEC bot's "1000 points max stop" could mean 10, 100 or 1000 index points on
@@ -97,14 +110,16 @@ a recurring source of off-by-a-bit bugs and there is no reason to repeat it.
 | L3 Futures & microstructure | ±15 | live |
 | L4 Macro & rates | ±15 | live |
 | L5 Regime | ±10 | live |
-| L6 Options & gamma | ±10 | phase 5 |
+| L6 Options & gamma | ±10 | live |
 | L7 Sector rotation | ±5 | live |
 
 **Unavailable layers are redistributed, not zeroed.** A missing layer scoring 0
 is not neutral — it silently drags the composite toward the midpoint and makes
 every signal look weaker than the evidence supports. Its budget is reallocated
 across the layers that did report, and the loss is shown as `coverage` in the
-UI. Current coverage with phase 5 unbuilt: **90%**.
+UI. With all seven layers built, coverage is **100%** — and drops to 90% on
+its own whenever component option liquidity is too thin to trust, which is
+the designed behaviour rather than a failure.
 
 ---
 
@@ -122,10 +137,13 @@ UI. Current coverage with phase 5 unbuilt: **90%**.
 | C8 | US30 vs NDX conflict at high correlation | Downgrade; upgrade if rotation |
 | C9 | Expected move < 3× round-trip cost | Block regardless of score |
 | C10 | ≥6 live layers agree | Upgrade |
+| C11 | Breakout into a long-gamma regime | Downgrade — dealers pin price |
+| C12 | Mean-reversion setup in short gamma | Block — do not fade amplification |
+| C13 | Today's move ≥95% of implied expected move | Block continuation |
 
-C7 is live as of phase 4. C4 and C5 need the earnings and ex-dividend calendars
-that phase 6 adds; the resolver reads every field defensively and simply does
-not fire until the data exists.
+C7 went live in phase 4; C11–C13 in phase 5. C4 and C5 need the earnings and
+ex-dividend calendars that phase 6 adds; the resolver reads every field
+defensively and simply does not fire until the data exists.
 
 ---
 
@@ -163,6 +181,33 @@ silently merges two sessions' overnight ranges.
 
 ---
 
+## Phase 5 notes — three things the options layer will not pretend to know
+
+**Dealer sign is a convention, not data.** Nobody outside the clearing system
+observes which side dealers are on. This uses the standard assumption —
+dealers long calls, short puts — so positive GEX means dealers are long gamma
+and their hedging suppresses movement. Every surface that shows a gamma number
+says so.
+
+**yfinance ships no greeks.** Gamma is computed here from Black-Scholes using
+the chain's own implied volatility, validated in the test suite against a
+numerical second derivative of the BS price at four spot/strike/tenor
+combinations. IV on illiquid strikes is frequently nonsense, so strikes outside
+±15% moneyness are dropped and names under a 2,000-contract OI floor are
+excluded entirely.
+
+**Gamma is a volatility regime, not a direction.** Long gamma suppresses moves,
+short gamma amplifies them; neither says which way price goes. The layer's
+small directional score comes only from skew and put/call ratio. The gamma read
+is exported as a regime that C11–C13 use to modulate other layers, plus a
+`vol_scalar` that scales overall confidence the same way dispersion does.
+
+If fewer than 30% of index weight has usable chains, the layer reports
+unavailable and C6 redistributes its budget. That is the design working, not
+an outage.
+
+---
+
 ## Files
 
 ```
@@ -171,13 +216,14 @@ data_layer.py          ALL yfinance access. Circuit breaker, column normalisatio
 dow_attribution.py     CORE — divisor, point contributions, breadth, concentration
 us30_technicals.py     CPR, pivots, EMA, RSI + decay, ATR, VWAP, divergence
 us30_micro.py          basis, overnight/prior levels, RVOL, delta proxy, sweeps
+dow_options.py         BS greeks, per-name GEX, point-weighted gamma regime
 us30_macro.py          rates, curve, DXY, oil, VXD/VIX
 us30_regime.py         trend/chop/revert + dispersion regime
 us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neither)
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     154 checks against constructed data, no network
+tests_synthetic.py     217 checks against constructed data, no network
 ```
 
 ---
@@ -189,7 +235,7 @@ tests_synthetic.py     154 checks against constructed data, no network
 - [x] Phase 2 — technicals on the correct tickers
 - [x] Phase 3 — macro, rates, sectors
 - [x] Phase 4 — YM basis, overnight levels, RVOL, sweeps, delta proxy
-- [ ] Phase 5 — component-weighted options gamma across the top 8
+- [x] Phase 5 — component-weighted options gamma across the top 8
 - [ ] Phase 6 — earnings and ex-dividend calendars to activate C4/C5
 - [ ] Phase 7 — `us30_journal.py`, 60-day forward test, **no live trading**
 - [ ] Phase 8 — MT5 wiring: point calibration, ATR sizing, R-aware breaker

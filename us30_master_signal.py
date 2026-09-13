@@ -9,10 +9,10 @@ there is no reason to repeat it.
                               point attribution is the closest thing to ground
                               truth about what the index is actually doing
     L2 technicals       ±20
-    L3 microstructure   ±15   phase 4
+    L3 microstructure   ±15
     L4 macro            ±15   weighted up: financials are 27.8% of the Dow
     L5 regime           ±10
-    L6 options          ±10   phase 5 — weighted DOWN from the NAS100 build's
+    L6 options          ±10   weighted DOWN from the NAS100 build's
                               19% on liquidity evidence: DIA options trade
                               ~13.9k contracts/day against QQQ's ~1.53M
     L7 sectors          ± 5
@@ -192,6 +192,7 @@ def resolve_conflicts(sig: MasterSignal, ctx: dict) -> MasterSignal:
     regime = ctx.get("regime")
     technicals = ctx.get("technicals")
     micro = ctx.get("micro")
+    options = ctx.get("options")
     cross = ctx.get("cross_index")
     earnings = ctx.get("earnings_top8") or []
     ex_div = ctx.get("ex_div_today") or []
@@ -340,6 +341,58 @@ def resolve_conflicts(sig: MasterSignal, ctx: dict) -> MasterSignal:
             sig.blocked = True
             sig.block_reasons.append("C9 cost gate — edge does not clear structure")
 
+    # ---- C11 long gamma suppresses breakouts ---------------------------------
+    # Dealers long gamma hedge AGAINST the move: they sell into strength and buy
+    # weakness. Breakout and continuation setups underperform in that regime.
+    if options is not None and getattr(options, "ok", False):
+        regime_g = getattr(options, "gamma_regime", "UNKNOWN")
+        breakout = False
+        if micro is not None:
+            levels = getattr(micro, "levels", None)
+            breakout = getattr(levels, "state", "") in ("ABOVE_ON", "BELOW_ON")
+        if regime_g == "LONG_GAMMA" and breakout and direction != 0:
+            sig.conflicts.append(Conflict(
+                "C11",
+                f"Breakout signal into a long-gamma regime "
+                f"(aggregate {getattr(options, 'aggregate_gex', 0):+.2f}) — dealer "
+                f"hedging sells strength and buys weakness, pinning price",
+                "Downgrade one conviction tier",
+                "downgrade",
+            ))
+            score = _downgrade(score)
+
+        # ---- C12 short gamma punishes fades ----------------------------------
+        reversion = getattr(technicals, "mean_reversion", "none") if technicals else "none"
+        if regime_g == "SHORT_GAMMA" and reversion != "none":
+            sig.conflicts.append(Conflict(
+                "C12",
+                f"Mean-reversion setup ({reversion}) in a short-gamma regime "
+                f"(aggregate {getattr(options, 'aggregate_gex', 0):+.2f}) — dealer "
+                f"hedging amplifies moves, so fading is the wrong side of the flow",
+                "Entry blocked",
+                "block",
+            ))
+            sig.blocked = True
+            sig.block_reasons.append("C12 short gamma — do not fade an amplifying tape")
+
+        # ---- C13 expected-move exhaustion ------------------------------------
+        exp_move = getattr(options, "expected_move_pts", float("nan"))
+        moved = abs(getattr(attribution, "index_change_pts", float("nan"))) \
+            if attribution is not None else float("nan")
+        if np.isfinite(exp_move) and exp_move > 0 and np.isfinite(moved):
+            used = moved / exp_move
+            exhaustion = getattr(config, "EXPECTED_MOVE_EXHAUSTION", 0.95)
+            if used >= exhaustion and direction != 0:
+                sig.conflicts.append(Conflict(
+                    "C13",
+                    f"Today's {moved:.0f}pt move is {used * 100:.0f}% of the "
+                    f"{exp_move:.0f}pt options-implied expected move",
+                    "Continuation blocked — the move is priced out",
+                    "block",
+                ))
+                sig.blocked = True
+                sig.block_reasons.append("C13 expected move exhausted")
+
     # ---- C10 agreement upgrade ----------------------------------------------
     live = [l for l in sig.layers if l.available and abs(l.score) > 0.5]
     if direction != 0 and len(live) >= config.C10_MIN_LAYERS_AGREE:
@@ -462,6 +515,12 @@ def build_master_signal(attribution=None, technicals=None, macro=None,
         sig.confidence = float(np.clip(
             sig.confidence * getattr(regime, "signal_confidence_scalar", 1.0), 0.0, 1.0
         ))
+    # Gamma regime is a VOLATILITY read, so it scales conviction the same way —
+    # long gamma pins price and makes every directional signal worth less.
+    if options is not None and getattr(options, "ok", False):
+        sig.confidence = float(np.clip(
+            sig.confidence * getattr(options, "vol_scalar", 1.0), 0.0, 1.0
+        ))
 
     ctx.setdefault("attribution", attribution)
     ctx.setdefault("technicals", technicals)
@@ -469,6 +528,7 @@ def build_master_signal(attribution=None, technicals=None, macro=None,
     ctx.setdefault("regime", regime)
     ctx.setdefault("sectors", sectors)
     ctx.setdefault("micro", micro)
+    ctx.setdefault("options", options)
 
     sig = resolve_conflicts(sig, ctx)
 
