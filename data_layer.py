@@ -421,6 +421,27 @@ def ohlcv(fetch: Fetch) -> pd.DataFrame:
     return out.dropna(subset=["Close"])
 
 
+def module_health(module) -> tuple[list[str], list[str]]:
+    """
+    Ask one module which config constants it is missing.
+
+    Written defensively on purpose. A module older than app.py does not HAVE
+    config_health(), so calling it directly turned the partial-deploy guard
+    into the thing that crashed on a partial deploy. A guard that can crash is
+    not a guard.
+
+    Returns (missing_constants, stale_module_names).
+    """
+    name = getattr(module, "__name__", "unknown")
+    fn = getattr(module, "config_health", None)
+    if not callable(fn):
+        return [], [f"{name}.py"]
+    try:
+        return list(fn()), []
+    except Exception:  # noqa: BLE001
+        return [], [f"{name}.py"]
+
+
 def last_two_closes(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """Latest close and prior close per column. Returns two aligned Series."""
     clean = frame.dropna(how="all")

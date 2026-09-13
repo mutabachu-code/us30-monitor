@@ -18,16 +18,36 @@ streamlit run app.py
 Streamlit Cloud: point the app at `app.py` in the repo root. Push every changed
 file in one commit.
 
-**If the app shows a redacted `AttributeError` on a constant:** that is a
-partial deploy — a module landed before its config constants. Since phase 4 the
-modules carry their own fallbacks so this no longer kills the app; you get a
-banner naming the missing constants instead. If you already pushed the current
-`config.py` and still see the error, the app crashed on the earlier commit and
-did not reload: **Manage app → Reboot app**. A crashed Streamlit app does not
-reliably pick up the next push.
+### Deploying without breaking it
 
-`CONFIG_VERSION` in `config.py` is bumped whenever a phase adds constants, and
-`app.py` compares it against what the code expects.
+Unzip over the whole folder and commit everything at once:
+
+```bash
+unzip -o us30-monitor.zip -d .. && git add -A && git commit -m "..." && git push
+```
+
+Pushing a subset is what causes the redacted `AttributeError` crashes: a module
+lands before the config constants it reads, and Python resolves those at import
+time, before any panel-level exception handling exists.
+
+Three layers now protect against that, and they are ordered deliberately:
+
+1. Each module carries **local defaults** for every constant its phase
+   introduced, read through a `_cfg()` helper at call time rather than at
+   import. A stale `config.py` costs a banner, not the app.
+2. `app.py` asks each module for its `config_health()` through
+   `data_layer.module_health()`, which treats a **missing or throwing**
+   `config_health` as "this file is older than app.py" and says so. This
+   matters because the first version of the guard called `config_health()`
+   directly — so a module older than `app.py` made the partial-deploy guard
+   itself the thing that crashed on a partial deploy. A guard that can crash
+   is not a guard.
+3. `CONFIG_VERSION` in `config.py` is bumped whenever a phase adds constants,
+   and `app.py` compares it against what the code expects.
+
+If you already pushed everything and still see the error, the app crashed on an
+earlier commit and did not reload: **Manage app → Reboot app**. A crashed
+Streamlit app does not reliably pick up the next push.
 
 ---
 
@@ -47,7 +67,7 @@ trusting any panel. Its output will revise some assumptions.
 The synthetic suite covers the part that breaks quietly — the maths:
 
 ```bash
-python tests_synthetic.py       # 217 checks, no network required
+python tests_synthetic.py       # 221 checks, no network required
 ```
 
 ---
@@ -223,7 +243,7 @@ us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neith
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     217 checks against constructed data, no network
+tests_synthetic.py     221 checks against constructed data, no network
 ```
 
 ---

@@ -1162,6 +1162,32 @@ check("single ticker collapses to plain columns",
       not isinstance(single.columns, pd.MultiIndex),
       str(type(single.columns)))
 
+# ---- the partial-deploy guard must not itself crash on a partial deploy ----
+# This reproduces the exact failure that took the live app down twice: app.py
+# called micro_mod.config_health() directly, and a module older than app.py
+# does not have that function.
+import types  # noqa: E402
+
+_old_module = types.ModuleType("us30_micro")      # no config_health at all
+check("a module with no config_health is reported stale, not crashed",
+      dl.module_health(_old_module) == ([], ["us30_micro.py"]),
+      str(dl.module_health(_old_module)))
+
+_broken = types.ModuleType("dow_options")
+_broken.config_health = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+check("a config_health that raises is caught and reported stale",
+      dl.module_health(_broken) == ([], ["dow_options.py"]),
+      str(dl.module_health(_broken)))
+
+_good = types.ModuleType("us30_micro")
+_good.config_health = lambda: ["RVOL_SPIKE"]
+check("a healthy module reports its missing constants",
+      dl.module_health(_good) == (["RVOL_SPIKE"], []),
+      str(dl.module_health(_good)))
+check("the real modules pass their own health check",
+      dl.module_health(micro_mod) == ([], [])
+      and dl.module_health(opt) == ([], [])),
+
 check("an unhappy Fetch is falsy", not bool(dl.Fetch(ok=False)))
 check("closes() of an empty Fetch is an empty frame",
       dl.closes(dl.Fetch(ok=False)).empty)

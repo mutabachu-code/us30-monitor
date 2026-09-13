@@ -43,18 +43,35 @@ st.set_page_config(page_title="US30 Monitor", page_icon="📉", layout="wide")
 # time with a redacted AttributeError. Now the modules carry their own
 # fallbacks and this banner names exactly which file is behind.
 EXPECTED_CONFIG_VERSION = 3
-_stale = micro_mod.config_health() + options_mod.config_health()
+
+
+# Lives in data_layer so it is unit-testable; reached through getattr so that a
+# stale data_layer cannot break the check either.
+_module_health = getattr(dl, "module_health", lambda m: ([], []))
+
+_missing: list[str] = []
+_stale_modules: list[str] = []
+for _mod in (micro_mod, options_mod):
+    _m, _s = _module_health(_mod)
+    _missing += _m
+    _stale_modules += _s
+
 _version = getattr(config, "CONFIG_VERSION", 1)
 
-if _stale or _version < EXPECTED_CONFIG_VERSION:
+if _stale_modules:
+    st.error(
+        f"**Partial deploy detected.** These files are older than `app.py`: "
+        f"`{'`, `'.join(_stale_modules)}`. The app is running, but those layers "
+        f"may misbehave. Push every changed file in ONE commit, then "
+        f"**Manage app → Reboot**."
+    )
+if _missing or _version < EXPECTED_CONFIG_VERSION:
     st.warning(
         f"**config.py looks stale** — it reports version {_version}, the code "
         f"expects {EXPECTED_CONFIG_VERSION}."
-        + (f" Missing: `{'`, `'.join(_stale)}`." if _stale else "")
+        + (f" Missing: `{'`, `'.join(_missing)}`." if _missing else "")
         + " The app is running on built-in defaults, so nothing is broken, but "
-        "push the current `config.py` and reboot to pick up your real settings. "
-        "If you just pushed it, use **Manage app → Reboot** — a crashed app does "
-        "not reliably reload on the next commit."
+        "push the current `config.py` and reboot to pick up your real settings."
     )
 
 
@@ -82,7 +99,10 @@ def signed(value: float, digits: int = 0) -> str:
 # Header
 # ==========================================================================
 now_et = datetime.now(ZoneInfo(config.MARKET_TZ))
-block, scalar = master.current_session_block(now_et)
+try:
+    block, scalar = master.current_session_block(now_et)
+except Exception:  # noqa: BLE001 — a stale master must not kill the header
+    block, scalar = "UNKNOWN", 1.0
 
 st.title("US30 Monitor")
 st.caption(
@@ -571,9 +591,9 @@ with tabs[7]:
         "sectors": sectors.note,
         "session_block": f"{block} (scalar {scalar})",
         "coverage": f"{signal.coverage * 100:.0f}%",
-        "data_breaker": dl.breaker_status(),
+        "data_breaker": getattr(dl, "breaker_status", lambda: "unavailable")(),
     })
-    if dl.breaker_open():
+    if getattr(dl, "breaker_open", lambda: False)():
         st.error(
             "Data circuit breaker is OPEN — Yahoo is failing, so every panel is "
             "showing its degraded state rather than stale or wrong numbers. "

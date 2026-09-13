@@ -42,6 +42,44 @@ from us30_technicals import atr
 
 
 # ==========================================================================
+# Stale-config tolerance
+# ==========================================================================
+# Deploying this repo means pushing several files at once, and a push that
+# lands a new module before its config constants used to take the whole app
+# down with a redacted AttributeError at import time — before a single panel
+# could render, and with no indication of which file was behind.
+#
+# Every constant this module introduced therefore has a local default. A stale
+# config.py now costs a visible warning banner instead of a dead app, and
+# `config_health()` names exactly what is missing.
+_CFG_DEFAULTS: dict[str, object] = {
+    "RVOL_BASELINE_DAYS": 20,
+    "RVOL_SPIKE": 1.5,
+    "RVOL_DRY": 0.6,
+    "SWEEP_LOOKBACK_BARS": 78,
+    "SWEEP_EQUAL_TOL_ATR": 0.12,
+    "SWEEP_MIN_PENETRATION_ATR": 0.05,
+    "SWEEP_REJECTION_FRAC": 0.5,
+    "SWEEP_RVOL_CONFIRM": 1.3,
+    "DELTA_DIVERGENCE_MIN_BARS": 12,
+    "BASIS_MIN_SAMPLES": 20,
+    "RTH_START": "09:30",
+    "RTH_END": "16:00",
+    "GLOBEX_START": "18:00",
+}
+
+
+def _cfg(name: str):
+    """Config constant, falling back to this module's own default."""
+    return getattr(config, name, _CFG_DEFAULTS[name])
+
+
+def config_health() -> list[str]:
+    """Constants missing from config.py — a non-empty list means it is stale."""
+    return [n for n in _CFG_DEFAULTS if not hasattr(config, n)]
+
+
+# ==========================================================================
 # Session helpers
 # ==========================================================================
 def to_et(df: pd.DataFrame) -> pd.DataFrame:
@@ -65,7 +103,7 @@ def session_dates(index: pd.DatetimeIndex) -> pd.Series:
     ts = pd.Series(index, index=index)
     base = ts.dt.normalize().dt.tz_localize(None)
 
-    globex_minute = int(config.GLOBEX_START[:2]) * 60 + int(config.GLOBEX_START[3:])
+    globex_minute = int(_cfg("GLOBEX_START")[:2]) * 60 + int(_cfg("GLOBEX_START")[3:])
     after_globex = (ts.dt.hour * 60 + ts.dt.minute) >= globex_minute
     sess = base.where(~after_globex, base + pd.Timedelta(days=1))
 
@@ -82,8 +120,8 @@ def rth_mask(index: pd.DatetimeIndex) -> np.ndarray:
     if len(index) == 0:
         return np.zeros(0, dtype=bool)
     minutes = index.hour * 60 + index.minute
-    start = int(config.RTH_START[:2]) * 60 + int(config.RTH_START[3:])
-    end = int(config.RTH_END[:2]) * 60 + int(config.RTH_END[3:])
+    start = int(_cfg("RTH_START")[:2]) * 60 + int(_cfg("RTH_START")[3:])
+    end = int(_cfg("RTH_END")[:2]) * 60 + int(_cfg("RTH_END")[3:])
     return (minutes >= start) & (minutes < end) & (index.dayofweek < 5)
 
 
@@ -189,7 +227,7 @@ def compute_basis(fut: pd.DataFrame, cash: pd.DataFrame) -> tuple[float, float, 
     joined = pd.DataFrame({"fut": f["Close"]}).join(
         pd.DataFrame({"cash": c["Close"]}), how="inner"
     ).dropna()
-    if len(joined) < config.BASIS_MIN_SAMPLES:
+    if len(joined) < _cfg("BASIS_MIN_SAMPLES"):
         return (np.nan,) * 4 + (False,)
 
     spread = joined["fut"] - joined["cash"]
@@ -203,11 +241,13 @@ def compute_basis(fut: pd.DataFrame, cash: pd.DataFrame) -> tuple[float, float, 
 # ==========================================================================
 # Relative volume
 # ==========================================================================
-def compute_rvol(bars: pd.DataFrame, baseline_days: int = config.RVOL_BASELINE_DAYS) -> tuple[float, pd.Series]:
+def compute_rvol(bars: pd.DataFrame,
+                 baseline_days: int | None = None) -> tuple[float, pd.Series]:
     """
     Relative volume for the latest bar against the SAME time-of-day slot on
     prior sessions. Returns (rvol, per-bar rvol series for today).
     """
+    baseline_days = int(_cfg("RVOL_BASELINE_DAYS")) if baseline_days is None else baseline_days
     empty = pd.Series(dtype=float)
     if bars is None or bars.empty or "Volume" not in bars.columns:
         return float("nan"), empty
@@ -288,11 +328,11 @@ def compute_delta(bars: pd.DataFrame) -> tuple[float, float, pd.Series]:
 
 def delta_divergence(bars: pd.DataFrame, delta: pd.Series) -> str:
     """Price making a new session extreme that cumulative delta does not confirm."""
-    if bars is None or bars.empty or delta.empty or len(delta) < config.DELTA_DIVERGENCE_MIN_BARS:
+    if bars is None or bars.empty or delta.empty or len(delta) < _cfg("DELTA_DIVERGENCE_MIN_BARS"):
         return "none"
     b = to_et(bars).reindex(delta.index).dropna(subset=["Close"])
     d = delta.reindex(b.index).dropna()
-    if len(d) < config.DELTA_DIVERGENCE_MIN_BARS:
+    if len(d) < _cfg("DELTA_DIVERGENCE_MIN_BARS"):
         return "none"
 
     half = len(d) // 2
@@ -383,7 +423,7 @@ def detect_sweeps(bars: pd.DataFrame, levels: Levels, atr_val: float,
     if bars is None or bars.empty or not np.isfinite(atr_val) or atr_val <= 0:
         return out
 
-    b = to_et(bars).dropna(subset=["Close", "High", "Low"]).tail(config.SWEEP_LOOKBACK_BARS)
+    b = to_et(bars).dropna(subset=["Close", "High", "Low"]).tail(_cfg("SWEEP_LOOKBACK_BARS"))
     if b.empty:
         return out
 
@@ -407,7 +447,7 @@ def detect_sweeps(bars: pd.DataFrame, levels: Levels, atr_val: float,
     if equal_low is not None:
         candidates.append(("low", "Equal lows", equal_low))
 
-    min_pen = atr_val * config.SWEEP_MIN_PENETRATION_ATR
+    min_pen = atr_val * _cfg("SWEEP_MIN_PENETRATION_ATR")
     n = len(b)
 
     for side, name, level in candidates:
@@ -422,12 +462,12 @@ def detect_sweeps(bars: pd.DataFrame, levels: Levels, atr_val: float,
                 penetration = high - level
                 if penetration < min_pen:
                     continue
-                rejected = (high - close) >= rng * config.SWEEP_REJECTION_FRAC and close < level
+                rejected = (high - close) >= rng * _cfg("SWEEP_REJECTION_FRAC") and close < level
             else:
                 penetration = level - low
                 if penetration < min_pen:
                     continue
-                rejected = (close - low) >= rng * config.SWEEP_REJECTION_FRAC and close > level
+                rejected = (close - low) >= rng * _cfg("SWEEP_REJECTION_FRAC") and close > level
             if not rejected:
                 continue
 
@@ -440,7 +480,7 @@ def detect_sweeps(bars: pd.DataFrame, levels: Levels, atr_val: float,
             out.append(Sweep(
                 side=side, level_name=name, level=float(level),
                 penetration=float(penetration), rvol=bar_rvol,
-                confirmed=bool(np.isnan(bar_rvol) or bar_rvol >= config.SWEEP_RVOL_CONFIRM),
+                confirmed=bool(np.isnan(bar_rvol) or bar_rvol >= _cfg("SWEEP_RVOL_CONFIRM")),
                 bars_ago=n - 1 - pos,
             ))
             break     # one sweep per level, the most recent
@@ -449,7 +489,7 @@ def detect_sweeps(bars: pd.DataFrame, levels: Levels, atr_val: float,
 
 def _equal_levels(bars: pd.DataFrame, atr_val: float) -> tuple[float | None, float | None]:
     """Clusters of swing highs / lows within tolerance — the liquidity pools."""
-    tol = atr_val * config.SWEEP_EQUAL_TOL_ATR
+    tol = atr_val * _cfg("SWEEP_EQUAL_TOL_ATR")
     if len(bars) < 9 or tol <= 0:
         return None, None
 
@@ -520,9 +560,9 @@ def compute_micro(fut_bars: pd.DataFrame,
     # ---- volume -----------------------------------------------------------
     rep.rvol, rvol_series = compute_rvol(b)
     if np.isfinite(rep.rvol):
-        if rep.rvol >= config.RVOL_SPIKE:
+        if rep.rvol >= _cfg("RVOL_SPIKE"):
             rep.rvol_state = "EXPANSION"
-        elif rep.rvol <= config.RVOL_DRY:
+        elif rep.rvol <= _cfg("RVOL_DRY"):
             rep.rvol_state = "DRY"
             rep.flags.append(
                 f"Dry tape (RVOL {rep.rvol:.2f}) — breakout reads suppressed"
