@@ -26,6 +26,7 @@ import config
 import data_layer as dl
 import dow_attribution as attr
 import dow_options as options_mod
+import us30_calendar as cal_mod
 import us30_macro as macro_mod
 import us30_micro as micro_mod
 import us30_regime as regime_mod
@@ -42,7 +43,7 @@ st.set_page_config(page_title="US30 Monitor", page_icon="📉", layout="wide")
 # lands a module before its config constants used to kill the app at import
 # time with a redacted AttributeError. Now the modules carry their own
 # fallbacks and this banner names exactly which file is behind.
-EXPECTED_CONFIG_VERSION = 3
+EXPECTED_CONFIG_VERSION = 4
 
 
 # Lives in data_layer so it is unit-testable; reached through getattr so that a
@@ -51,7 +52,7 @@ _module_health = getattr(dl, "module_health", lambda m: ([], []))
 
 _missing: list[str] = []
 _stale_modules: list[str] = []
-for _mod in (micro_mod, options_mod):
+for _mod in (micro_mod, options_mod, cal_mod):
     _m, _s = _module_health(_mod)
     _missing += _m
     _stale_modules += _s
@@ -170,11 +171,35 @@ with st.spinner("Loading engines..."):
     except Exception as exc:  # noqa: BLE001
         options = options_mod.OptionsReport(note=f"options crashed: {exc}")
 
+    # Calendar needs the live top-8 ranking, which only attribution can give.
+    try:
+        top8 = attr.rank_by_weight(attribution, 8) if attribution.ok else config.COMPONENTS[:8]
+        calendar = cal_mod.get_calendar(top8)
+    except Exception as exc:  # noqa: BLE001
+        calendar = cal_mod.CalendarReport(note=f"calendar crashed: {exc}")
+
+    # An ex-dividend drop is mechanical, not information. Recompute attribution
+    # with those contributions neutralised — the underlying fetch is cached, so
+    # the second pass costs nothing.
+    if calendar.ex_div_today:
+        try:
+            attribution = attr.get_attribution(ex_div_today=set(calendar.ex_div_today))
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         signal = master.build_master_signal(
             attribution=attribution, technicals=technicals, macro=macro,
             regime=regime, sectors=sectors, micro=micro, options=options,
-            ctx={"spread_pts": spread_pts, "slippage_pts": slippage_pts},
+            ctx={
+                "spread_pts": spread_pts,
+                "slippage_pts": slippage_pts,
+                "now": now_et,
+                "earnings_top8": calendar.earnings_within_window,
+                "ex_div_today": calendar.ex_div_today,
+                "cross_index": calendar.cross_index,
+                "event_blackout": calendar.active_blackout,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         signal = master.MasterSignal()
@@ -538,6 +563,99 @@ def render_options():
         st.caption(f"• {f}")
 
 
+@panel("Calendar")
+def render_calendar():
+    st.subheader("Event risk, earnings & ex-dividends")
+    if not calendar.ok:
+        st.warning(calendar.note or "calendar unavailable")
+        return
+
+    if calendar.active_blackout is not None:
+        e = calendar.active_blackout
+        mins = e.minutes_until(calendar.now)
+        st.error(
+            f"**{e.name} blackout active** — {abs(mins):.0f} minutes "
+            f"{'until' if mins >= 0 else 'since'} the release ({e.detail}). "
+            f"C14 has blocked new entries."
+        )
+    elif calendar.next_event is not None:
+        e = calendar.next_event
+        st.info(
+            f"Next high-impact event: **{e.name}** "
+            f"{e.when:%a %d %b %H:%M} ET — in "
+            f"{_humanise_minutes(e.minutes_until(calendar.now))}. {e.detail}"
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    cross = calendar.cross_index or {}
+    corr = cross.get("correlation", float("nan"))
+    c1.metric("Events in horizon", len(calendar.upcoming))
+    c2.metric("Earnings in window", len(calendar.earnings_within_window),
+              ", ".join(calendar.earnings_within_window) or "none")
+    c3.metric("Ex-div today", len(calendar.ex_div_today),
+              ", ".join(calendar.ex_div_today) or "none")
+    c4.metric("DJIA/NDX correlation",
+              f"{corr:.2f}" if np.isfinite(corr) else "—",
+              cross.get("regime", "UNKNOWN"))
+
+    if cross.get("regime") == "ROTATION":
+        st.caption(
+            "Low correlation is a **rotation regime** — money moving out of tech "
+            "into value is bullish for the Dow specifically, which is why C8 "
+            "upgrades rather than downgrades here."
+        )
+
+    st.markdown("**Upcoming high-impact events**")
+    if calendar.events_frame.empty:
+        st.caption("Nothing in the horizon.")
+    else:
+        st.dataframe(calendar.events_frame, width="stretch", hide_index=True)
+
+    st.markdown("**Earnings — top 8 by price weight**")
+    st.dataframe(pd.DataFrame([{
+        "ticker": e.ticker,
+        "next earnings": e.when.strftime("%a %d %b %H:%M") if e.when else "—",
+        "source": e.source,
+        "confidence": e.confidence,
+        "note": e.note,
+    } for e in calendar.earnings]), width="stretch", hide_index=True)
+
+    st.markdown("**Ex-dividend dates**")
+    st.dataframe(pd.DataFrame([{
+        "ticker": d.ticker,
+        "ex-date": d.ex_date.strftime("%a %d %b") if d.ex_date else "—",
+        "last amount": round(d.amount, 2) if np.isfinite(d.amount) else None,
+        "source": d.source,
+        "ESTIMATED": d.estimated,
+    } for d in calendar.dividends]), width="stretch", hide_index=True)
+
+    st.warning(
+        "**yfinance earnings dates are frequently wrong** — stale by months in "
+        "some cases, missing entirely in others. C4 therefore widens stops and "
+        "caps size rather than blocking, and any ex-dividend date marked "
+        "ESTIMATED was inferred from historical payout cadence, not reported. "
+        "Verify both against the company's investor-relations page before "
+        "leaning on them."
+    )
+
+    age = calendar.calendar_age_days
+    st.caption(
+        f"FOMC and CPI tables verified {getattr(config, 'CALENDAR_VERIFIED_ON', '?')} "
+        f"({age} days ago) against federalreserve.gov and the BLS schedule. "
+        f"NFP is computed from the first-Friday rule, so it never goes stale."
+    )
+    for f in calendar.flags:
+        st.warning(f)
+
+
+def _humanise_minutes(minutes: float) -> str:
+    if minutes < 60:
+        return f"{minutes:.0f} minutes"
+    if minutes < 60 * 24:
+        return f"{minutes / 60:.1f} hours"
+    return f"{minutes / 1440:.1f} days"
+
+
 @panel("Sectors")
 def render_sectors():
     st.subheader("Sector rotation — Dow-weighted")
@@ -564,7 +682,7 @@ render_signal()
 st.divider()
 
 tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Options",
-                "Macro", "Regime", "Sectors", "Diagnostics"])
+                "Macro", "Regime", "Sectors", "Calendar", "Diagnostics"])
 with tabs[0]:
     render_attribution()
 with tabs[1]:
@@ -580,12 +698,15 @@ with tabs[5]:
 with tabs[6]:
     render_sectors()
 with tabs[7]:
+    render_calendar()
+with tabs[8]:
     st.subheader("Diagnostics")
     st.write({
         "attribution": attribution.note,
         "technicals": technicals.note,
         "microstructure": micro.note,
         "options": options.note,
+        "calendar": calendar.note,
         "macro": macro.note,
         "regime": regime.note,
         "sectors": sectors.note,

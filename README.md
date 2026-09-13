@@ -67,7 +67,7 @@ trusting any panel. Its output will revise some assumptions.
 The synthetic suite covers the part that breaks quietly — the maths:
 
 ```bash
-python tests_synthetic.py       # 221 checks, no network required
+python tests_synthetic.py       # 304 checks, no network required
 ```
 
 ---
@@ -160,10 +160,11 @@ the designed behaviour rather than a failure.
 | C11 | Breakout into a long-gamma regime | Downgrade — dealers pin price |
 | C12 | Mean-reversion setup in short gamma | Block — do not fade amplification |
 | C13 | Today's move ≥95% of implied expected move | Block continuation |
+| C14 | Inside a high-impact event blackout window | Block — no edge through a print |
 
-C7 went live in phase 4; C11–C13 in phase 5. C4 and C5 need the earnings and
-ex-dividend calendars that phase 6 adds; the resolver reads every field
-defensively and simply does not fire until the data exists.
+All fourteen are live. C7 went live in phase 4, C11–C13 in phase 5, and
+C4/C5/C8/C14 in phase 6. The resolver still reads every field defensively, so
+a missing data source silences a conflict rather than crashing it.
 
 ---
 
@@ -228,6 +229,38 @@ an outage.
 
 ---
 
+## Phase 6 notes — the calendar is a gate, not a layer
+
+The seven layers still sum to ±100 and `us30_calendar.py` adds no score. That
+is deliberate: "there is an FOMC statement in twenty minutes" is not a bullish
+or bearish opinion, it is a reason not to have a position. The calendar feeds
+C4, C5, C8 and C14, and nothing else.
+
+**NFP is computed, not listed.** Non-farm payrolls is the first Friday of the
+month, so it is derived from the rule and can never go stale. Anything
+derivable is derived.
+
+**FOMC and CPI are hardcoded, and hardcoded tables rot.** They come from
+federalreserve.gov and the BLS schedule, verified on `CALENDAR_VERIFIED_ON`,
+and each table carries its own end date. Past that end date the module reports
+*"past the end of the table"* rather than returning no upcoming events — a
+calendar that silently returns nothing reads as an all-clear, which is the
+worst possible failure mode for an event gate. The app also warns once the
+tables are more than `CALENDAR_STALE_AFTER_DAYS` old.
+
+**yfinance earnings dates are frequently wrong** — stale by months in some
+cases, missing entirely in others. Every entry is labelled with its source and
+confidence, C4 caps size and widens the stop rather than blocking, and an
+ex-dividend date inferred from historical payout cadence is marked ESTIMATED
+and flagged. Verify against investor relations before leaning on either.
+
+**Ex-dividend handling closes a real loop.** When a top-8 name goes ex-div, the
+app recomputes attribution with that name's contribution neutralised — UNH
+going ex at $3/share is an 18-point index drop carrying no information. The
+underlying fetch is cached, so the second pass is free.
+
+---
+
 ## Files
 
 ```
@@ -240,10 +273,11 @@ dow_options.py         BS greeks, per-name GEX, point-weighted gamma regime
 us30_macro.py          rates, curve, DXY, oil, VXD/VIX
 us30_regime.py         trend/chop/revert + dispersion regime
 us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neither)
+us30_calendar.py       event risk, earnings, ex-dividends, DJIA/NDX correlation
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     221 checks against constructed data, no network
+tests_synthetic.py     304 checks against constructed data, no network
 ```
 
 ---
@@ -256,7 +290,7 @@ tests_synthetic.py     221 checks against constructed data, no network
 - [x] Phase 3 — macro, rates, sectors
 - [x] Phase 4 — YM basis, overnight levels, RVOL, sweeps, delta proxy
 - [x] Phase 5 — component-weighted options gamma across the top 8
-- [ ] Phase 6 — earnings and ex-dividend calendars to activate C4/C5
+- [x] Phase 6 — event calendar, earnings, ex-dividends, cross-index (C4/C5/C8/C14)
 - [ ] Phase 7 — `us30_journal.py`, 60-day forward test, **no live trading**
 - [ ] Phase 8 — MT5 wiring: point calibration, ATR sizing, R-aware breaker
 

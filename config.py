@@ -15,7 +15,8 @@ from __future__ import annotations
 # modules expect and names the stale file, instead of dying on a redacted
 # AttributeError before a single panel renders.
 #   1 = phases 0-3   2 = phase 4 (microstructure)   3 = phase 5 (options)
-CONFIG_VERSION = 3
+#   4 = phase 6 (calendar)
+CONFIG_VERSION = 4
 
 # ----------------------------------------------------------------------------
 # Constituents (seed list — verified 12 Sep 2026, post GOOGL/VZ swap of 29 Jun 2026)
@@ -215,6 +216,31 @@ DEFAULT_RISK_FREE = 0.04            # fallback if ^IRX does not resolve
 GAMMA_LONG_THRESHOLD = 0.15         # dealers long gamma  -> suppresses moves
 GAMMA_SHORT_THRESHOLD = -0.15       # dealers short gamma -> amplifies moves
 EXPECTED_MOVE_EXHAUSTION = 0.95     # today's move vs expected move
+
+# ----------------------------------------------------------------------------
+# Calendar (phase 6)
+# ----------------------------------------------------------------------------
+# A hardcoded calendar goes silently wrong. This date is what us30_calendar
+# compares against to tell you the tables need re-checking, and the FOMC/CPI
+# lists below carry their own end dates so the app can say "past the end of
+# the table" instead of quietly reporting no upcoming events.
+CALENDAR_VERIFIED_ON = "2026-09-13"
+CALENDAR_STALE_AFTER_DAYS = 120
+
+# Blackout either side of a high-impact release, in minutes. A 15-90 minute
+# scalp has no edge through an FOMC statement.
+EVENT_BLACKOUT_BEFORE_MIN = 30
+EVENT_BLACKOUT_AFTER_MIN = 15
+EVENT_HORIZON_DAYS = 10
+
+# C4: a top-8 name reporting inside this window is 60-250 points of gap risk.
+EARNINGS_WINDOW_HOURS = 24
+
+# C8: rolling window for the DJIA/NDX return correlation.
+CROSS_CORR_WINDOW = 20
+CROSS_CORR_HIGH = 0.70
+CROSS_CORR_LOW = 0.35
+CROSS_DIRECTION_LOOKBACK = 5
 
 # Time-of-day blocks (US/Eastern). Score the same setup differently by block.
 SESSION_BLOCKS = [

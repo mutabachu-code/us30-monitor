@@ -1122,7 +1122,306 @@ check("options config restored", opt.config_health() == [])
 
 
 # ==========================================================================
-print("\n[11] Data layer guards")
+print("\n[11] Calendar — phase 6")
+# ==========================================================================
+import us30_calendar as cal  # noqa: E402
+from datetime import date as _date, datetime as _dt, timedelta as _td  # noqa: E402
+from zoneinfo import ZoneInfo as _ZI  # noqa: E402
+
+ET = _ZI(config.MARKET_TZ)
+
+# ---- NFP: first Friday, derived not listed --------------------------------
+# Verified against a real calendar: these are the first Fridays of each month.
+KNOWN_NFP = {
+    _date(2026, 9, 4), _date(2026, 10, 2), _date(2026, 11, 6),
+    _date(2026, 12, 4), _date(2027, 1, 1), _date(2027, 2, 5),
+}
+got = set(cal.nfp_dates(_date(2026, 9, 1), _date(2027, 2, 28)))
+check("NFP first-Friday rule matches known dates", KNOWN_NFP <= got,
+      f"missing {sorted(KNOWN_NFP - got)}")
+check("every computed NFP date is a Friday",
+      all(d.weekday() == 4 for d in got), str([d for d in got if d.weekday() != 4]))
+check("every computed NFP date is in the first 7 days of its month",
+      all(d.day <= 7 for d in got), str([d for d in got if d.day > 7]))
+check("one NFP per month over the range", len(got) == 6, str(sorted(got)))
+check("NFP handles a month starting on Friday",
+      _date(2027, 1, 1) in got, "Jan 2027 starts on a Friday")
+check("empty range yields no NFP dates",
+      cal.nfp_dates(_date(2026, 9, 5), _date(2026, 9, 20)) == [])
+
+# ---- hardcoded tables integrity -------------------------------------------
+fomc = [_date.fromisoformat(d) for d, _ in cal.FOMC_DECISION_DAYS]
+check("FOMC table is sorted", fomc == sorted(fomc))
+check("FOMC has 8 meetings in 2026",
+      sum(1 for d in fomc if d.year == 2026) == 8,
+      str([d for d in fomc if d.year == 2026]))
+check("FOMC has 8 meetings in 2027",
+      sum(1 for d in fomc if d.year == 2027) == 8)
+check("no FOMC decision lands on a weekend",
+      all(d.weekday() < 5 for d in fomc), str([d for d in fomc if d.weekday() >= 5]))
+check("Sept 2026 FOMC decision day is the 16th",
+      _date(2026, 9, 16) in fomc)
+check("Dec 2026 FOMC decision day is the 9th", _date(2026, 12, 9) in fomc)
+check("four SEP meetings per year",
+      sum(1 for d, sep in cal.FOMC_DECISION_DAYS
+          if sep and _date.fromisoformat(d).year == 2026) == 4)
+
+cpi = [_date.fromisoformat(d) for d in cal.CPI_RELEASE_DAYS]
+check("CPI table is sorted", cpi == sorted(cpi))
+check("12 CPI releases in 2026", len(cpi) == 12)
+check("no CPI release lands on a weekend",
+      all(d.weekday() < 5 for d in cpi), str([d for d in cpi if d.weekday() >= 5]))
+check("one CPI release per month",
+      sorted(d.month for d in cpi) == list(range(1, 13)))
+check("Oct 2026 CPI is the 14th", _date(2026, 10, 14) in cpi)
+check("table end dates match the last row",
+      cal.CPI_TABLE_ENDS == cpi[-1] and cal.FOMC_TABLE_ENDS == fomc[-1])
+
+# ---- event assembly --------------------------------------------------------
+NOW_CAL = _dt(2026, 9, 14, 10, 0, tzinfo=ET)      # Monday, two days before FOMC
+events, past_end = cal.build_events(NOW_CAL, horizon_days=10)
+check("events are returned in chronological order",
+      [e.when for e in events] == sorted(e.when for e in events))
+names = [e.name for e in events]
+check("FOMC on 16 Sep appears in a 10-day horizon", "FOMC" in names, str(names))
+check("not past the end of the tables in Sept 2026", not past_end)
+check("FOMC statement is timed at 14:00 ET",
+      all(e.when.hour == 14 and e.when.minute == 0 for e in events if e.name == "FOMC"))
+check("CPI and NFP are timed at 08:30 ET",
+      all(e.when.hour == 8 and e.when.minute == 30
+          for e in events if e.name in ("CPI", "NFP")))
+check("a 1-day horizon returns fewer events than a 30-day one",
+      len(cal.build_events(NOW_CAL, 1)[0]) < len(cal.build_events(NOW_CAL, 30)[0]))
+
+# Past the end of the tables, silence must NOT read as an all-clear.
+_, past_end_far = cal.build_events(_dt(2028, 3, 1, 10, 0, tzinfo=ET), 10)
+check("past the table end is reported, not silently empty", past_end_far)
+
+# ---- blackout windows ------------------------------------------------------
+FOMC_AT = _dt(2026, 9, 16, 14, 0, tzinfo=ET)
+ev = [cal.Event("FOMC", FOMC_AT, "HIGH", "statement")]
+for offset_min, expect, label in [
+    (-31, False, "31 minutes before is outside the window"),
+    (-30, True, "30 minutes before is inside"),
+    (-1, True, "1 minute before is inside"),
+    (0, True, "at the release is inside"),
+    (14, True, "14 minutes after is inside"),
+    (15, True, "15 minutes after is the boundary"),
+    (16, False, "16 minutes after is outside"),
+]:
+    at = FOMC_AT + _td(minutes=offset_min)
+    check(f"blackout: {label}", (cal.find_blackout(ev, at) is not None) == expect,
+          f"offset={offset_min}")
+
+check("no blackout when nothing is scheduled",
+      cal.find_blackout([], _dt(2026, 9, 14, 11, 0, tzinfo=ET)) is None)
+
+# ---- earnings parsing: every shape yfinance is known to return -------------
+future_ts = pd.Timestamp("2026-09-15 16:30")
+past_ts = pd.Timestamp("2026-06-15 16:30")
+
+e_dict = cal.parse_earnings("GS", {"Earnings Date": [future_ts]}, None)
+check("earnings parsed from a calendar dict",
+      e_dict.when is not None and e_dict.source == "calendar", e_dict.note)
+check("parsed earnings carry reported confidence", e_dict.confidence == "reported")
+
+e_scalar = cal.parse_earnings("GS", {"Earnings Date": future_ts}, None)
+check("a scalar earnings date parses as well as a list",
+      e_scalar.when is not None, e_scalar.note)
+
+e_df = cal.parse_earnings(
+    "CAT", None, pd.DataFrame({"EPS Estimate": [1.0]}, index=[future_ts]))
+check("earnings parsed from get_earnings_dates frame",
+      e_df.when is not None and e_df.source == "earnings_dates", e_df.note)
+
+e_stale = cal.parse_earnings("MSFT", {"Earnings Date": [past_ts]}, None)
+check("only-past earnings dates are rejected, not reported as next",
+      e_stale.when is None, e_stale.note)
+check("stale earnings say why", "stale" in e_stale.note, e_stale.note)
+
+e_none = cal.parse_earnings("UNH", None, None)
+check("missing earnings data degrades safely",
+      e_none.when is None and e_none.confidence == "none")
+e_junk = cal.parse_earnings("V", {"Earnings Date": ["not a date"]}, None)
+check("unparseable earnings data degrades safely", e_junk.when is None)
+
+# ---- ex-dividend parsing ----------------------------------------------------
+d_rep = cal.parse_ex_dividend("GS", {"Ex-Dividend Date": pd.Timestamp("2026-09-13")}, None)
+check("reported ex-div date is used and not marked estimated",
+      d_rep.ex_date == _date(2026, 9, 13) and not d_rep.estimated)
+check("reported ex-div records its source", d_rep.source == "calendar")
+
+quarterly = pd.Series(
+    [1.0, 1.0, 1.05, 1.05],
+    index=pd.to_datetime(["2025-09-12", "2025-12-12", "2026-03-13", "2026-06-12"]))
+d_inf = cal.parse_ex_dividend("JPM", None, quarterly)
+check("ex-div inferred from quarterly cadence", d_inf.ex_date is not None, str(d_inf))
+check("inferred ex-div is MARKED estimated", d_inf.estimated)
+check("inferred ex-div lands roughly one quarter on",
+      d_inf.ex_date is not None and 80 <= (d_inf.ex_date - _date(2026, 6, 12)).days <= 100,
+      str(d_inf.ex_date))
+check("last dividend amount captured", close_to(d_inf.amount, 1.05, 1e-9))
+
+d_thin = cal.parse_ex_dividend("NKE", None, pd.Series(dtype=float))
+check("no dividend history degrades safely", d_thin.ex_date is None)
+
+# ---- cross-index -------------------------------------------------------------
+n_c = 80
+idx_c = pd.date_range("2026-05-01", periods=n_c, freq="B")
+base_c = np.cumsum(rng.normal(0, 1, n_c))
+coupled_dji = pd.Series(52000 + base_c * 100, index=idx_c)
+coupled_ndx = pd.Series(26000 + base_c * 50, index=idx_c)
+cx = cal.compute_cross_index(coupled_dji, coupled_ndx)
+check("identical drivers give near-perfect correlation",
+      cx["correlation"] > 0.95, f"{cx['correlation']}")
+check("high correlation is labelled COUPLED", cx["regime"] == "COUPLED", cx["regime"])
+
+rot_ndx = pd.Series(26000 - base_c * 50, index=idx_c)
+cx_rot = cal.compute_cross_index(coupled_dji, rot_ndx)
+check("opposed drivers give negative correlation", cx_rot["correlation"] < -0.95)
+check("low correlation is labelled ROTATION", cx_rot["regime"] == "ROTATION")
+check("directions are opposite in a rotation",
+      cx_rot["dji_direction"] == -cx_rot["ndx_direction"]
+      or cx_rot["ndx_direction"] == 0, str(cx_rot))
+
+check("too little history degrades safely",
+      not np.isfinite(cal.compute_cross_index(
+          coupled_dji.head(5), coupled_ndx.head(5))["correlation"]))
+check("empty series degrade safely",
+      cal.compute_cross_index(pd.Series(dtype=float), pd.Series(dtype=float))
+      ["regime"] == "UNKNOWN")
+
+# ---- report assembly ---------------------------------------------------------
+earn_soon = cal.EarningsEntry("GS", _dt(2026, 9, 14, 16, 30, tzinfo=ET),
+                              "calendar", "reported")
+earn_far = cal.EarningsEntry("CAT", _dt(2026, 10, 20, 16, 30, tzinfo=ET),
+                             "calendar", "reported")
+div_today = cal.DividendEntry("UNH", _date(2026, 9, 14), 2.1, "calendar", False)
+div_est = cal.DividendEntry("V", _date(2026, 9, 14), 0.6, "inferred", True)
+div_later = cal.DividendEntry("JPM", _date(2026, 10, 5), 1.4, "calendar", False)
+
+rep_cal = cal.build_report(NOW_CAL, [earn_soon, earn_far],
+                           [div_today, div_est, div_later], cx)
+check("calendar report ok", rep_cal.ok, rep_cal.note)
+check("earnings inside 24h are flagged",
+      rep_cal.earnings_within_window == ["GS"], str(rep_cal.earnings_within_window))
+check("earnings a month out are not flagged", "CAT" not in rep_cal.earnings_within_window)
+check("today's ex-dividends are collected",
+      sorted(rep_cal.ex_div_today) == ["UNH", "V"], str(rep_cal.ex_div_today))
+check("a later ex-div is not collected", "JPM" not in rep_cal.ex_div_today)
+check("an ESTIMATED ex-div raises a flag",
+      any("INFERRED" in f for f in rep_cal.flags), str(rep_cal.flags))
+
+rep_unres = cal.build_report(NOW_CAL, [cal.EarningsEntry("BA")], [], {})
+check("names with no earnings date are named in a flag",
+      any("BA" in f for f in rep_unres.flags), str(rep_unres.flags))
+
+# ---- C4 / C5 / C8 / C14 ------------------------------------------------------
+def base_kwargs(**over):
+    kw = dict(
+        attribution=Stub(22, index_change_pts=80.0, pw_advance_pts=120.0,
+                         pw_decline_pts=40.0, top2_share=0.3, participation=0.5,
+                         advancers=20, decliners=10, table=pd.DataFrame()),
+        technicals=Stub(18, price=52000, atr14=400, mean_reversion="none"),
+        regime=Stub(8, regime="TREND", signal_confidence_scalar=1.0),
+        micro=Stub(6, levels=Lv("INSIDE_ON"), basis_sigma=float("nan")),
+    )
+    kw.update(over)
+    return kw
+
+
+NOW_T = pd.Timestamp("2026-09-14 11:00", tz=TZ).to_pydatetime()
+
+sig_c4 = master.build_master_signal(
+    **base_kwargs(), ctx={"now": NOW_T, "earnings_top8": ["GS"]})
+check("C4 fires on a top-8 name reporting inside 24h",
+      any(c.code == "C4" for c in sig_c4.conflicts),
+      str([c.code for c in sig_c4.conflicts]))
+check("C4 caps the lot multiplier rather than blocking",
+      not sig_c4.blocked and sig_c4.plan.lot_multiplier > 0, str(sig_c4.plan))
+
+sig_noearn = master.build_master_signal(
+    **base_kwargs(), ctx={"now": NOW_T, "earnings_top8": []})
+check("C4 stays silent with no earnings in the window",
+      not any(c.code == "C4" for c in sig_noearn.conflicts))
+check("C4 widens the stop relative to no earnings",
+      sig_c4.plan.risk_pts > sig_noearn.plan.risk_pts,
+      f"{sig_c4.plan.risk_pts} vs {sig_noearn.plan.risk_pts}")
+check("C4 halves the lot multiplier",
+      sig_c4.plan.lot_multiplier < sig_noearn.plan.lot_multiplier,
+      f"{sig_c4.plan.lot_multiplier} vs {sig_noearn.plan.lot_multiplier}")
+
+sig_c5 = master.build_master_signal(
+    **base_kwargs(), ctx={"now": NOW_T, "ex_div_today": ["UNH"]})
+check("C5 fires on an ex-dividend day",
+      any(c.code == "C5" for c in sig_c5.conflicts),
+      str([c.code for c in sig_c5.conflicts]))
+check("C5 warns rather than blocking", not sig_c5.blocked)
+
+sig_c8 = master.build_master_signal(
+    **base_kwargs(),
+    ctx={"now": NOW_T, "cross_index": {"correlation": 0.88, "ndx_direction": -1}})
+check("C8 fires when NDX opposes at high correlation",
+      any(c.code == "C8" for c in sig_c8.conflicts),
+      str([c.code for c in sig_c8.conflicts]))
+check("C8 downgrades the score",
+      abs(sig_c8.final_score) < abs(sig_noearn.final_score),
+      f"{sig_c8.final_score} vs {sig_noearn.final_score}")
+
+sig_c8_rot = master.build_master_signal(
+    **base_kwargs(),
+    ctx={"now": NOW_T, "cross_index": {"correlation": 0.20, "ndx_direction": -1}})
+check("C8 UPGRADES in a rotation regime instead",
+      abs(sig_c8_rot.final_score) > abs(sig_c8.final_score),
+      f"rotation={sig_c8_rot.final_score} coupled={sig_c8.final_score}")
+
+blackout_ev = cal.Event("CPI", _dt(2026, 9, 14, 11, 20, tzinfo=ET), "HIGH", "08:30 ET")
+sig_c14 = master.build_master_signal(
+    **base_kwargs(), ctx={"now": NOW_T, "event_blackout": blackout_ev})
+check("C14 fires inside an event blackout",
+      any(c.code == "C14" for c in sig_c14.conflicts),
+      str([c.code for c in sig_c14.conflicts]))
+check("C14 blocks entry outright", sig_c14.blocked)
+check("C14 produces no trade plan", not sig_c14.plan.valid)
+check("no blackout means no C14",
+      not any(c.code == "C14" for c in sig_noearn.conflicts))
+
+# ---- ex-div neutralisation actually reaches attribution ---------------------
+prev_xd2 = last.copy()
+prev_xd2["JPM"] = last["JPM"] + 1.4
+idx_now = float(last.sum()) / DIV
+rep_with = attr.compute_attribution(last, prev_xd2, idx_now,
+                                    float(prev_xd2.sum()) / DIV)
+rep_without = attr.compute_attribution(last, prev_xd2, idx_now,
+                                       float(prev_xd2.sum()) / DIV,
+                                       ex_div_today={"JPM"})
+check("ex-div neutralisation changes the attribution result",
+      abs(float(rep_with.table.loc["JPM", "points"])) > 1.0
+      and close_to(float(rep_without.table.loc["JPM", "points"]), 0.0, 1e-9),
+      f"with={rep_with.table.loc['JPM', 'points']}")
+
+# ---- stale config ------------------------------------------------------------
+_saved_c = {}
+for _name in list(cal._CFG_DEFAULTS):
+    if hasattr(config, _name):
+        _saved_c[_name] = getattr(config, _name)
+        delattr(config, _name)
+check("stale calendar config is detected and named",
+      sorted(cal.config_health()) == sorted(_saved_c), str(cal.config_health()))
+check("calendar still builds events on a stale config",
+      len(cal.build_events(NOW_CAL, 10)[0]) > 0)
+check("blackout still works on a stale config",
+      cal.find_blackout(ev, FOMC_AT) is not None)
+for _name, _val in _saved_c.items():
+    setattr(config, _name, _val)
+check("calendar config restored", cal.config_health() == [])
+
+check("layers are still 7 — the calendar is a gate, not a layer",
+      len(config.LAYER_WEIGHTS) == 7 and sum(config.LAYER_WEIGHTS.values()) == 100)
+
+
+# ==========================================================================
+print("\n[12] Data layer guards")
 # ==========================================================================
 import data_layer as dl  # noqa: E402
 

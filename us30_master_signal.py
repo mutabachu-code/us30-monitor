@@ -393,6 +393,26 @@ def resolve_conflicts(sig: MasterSignal, ctx: dict) -> MasterSignal:
                 sig.blocked = True
                 sig.block_reasons.append("C13 expected move exhausted")
 
+    # ---- C14 high-impact event blackout --------------------------------------
+    # A 15-90 minute scalp has no edge through an FOMC statement or a CPI
+    # print. This blocks on the CLOCK, before any layer gets a say, because no
+    # amount of confluence survives a number nobody has seen yet.
+    blackout = ctx.get("event_blackout")
+    if blackout is not None:
+        name = getattr(blackout, "name", "event")
+        mins = getattr(blackout, "minutes_until", lambda _n: float("nan"))(
+            ctx.get("now") or datetime.now(ZoneInfo(config.MARKET_TZ)))
+        when = "in" if mins >= 0 else "since"
+        sig.conflicts.append(Conflict(
+            "C14",
+            f"{name} {when} {abs(mins):.0f} minutes "
+            f"({getattr(blackout, 'detail', '')})".strip(),
+            "Entry blocked through the release window",
+            "block",
+        ))
+        sig.blocked = True
+        sig.block_reasons.append(f"C14 {name} blackout")
+
     # ---- C10 agreement upgrade ----------------------------------------------
     live = [l for l in sig.layers if l.available and abs(l.score) > 0.5]
     if direction != 0 and len(live) >= config.C10_MIN_LAYERS_AGREE:
