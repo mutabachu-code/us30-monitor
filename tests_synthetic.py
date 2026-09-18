@@ -1217,32 +1217,36 @@ check("no blackout when nothing is scheduled",
       cal.find_blackout([], _dt(2026, 9, 14, 11, 0, tzinfo=ET)) is None)
 
 # ---- earnings parsing: every shape yfinance is known to return -------------
+# Relative to the injected clock, never absolute — a fixture pinned to a real
+# date silently becomes a failure the moment that date passes, which is exactly
+# what happened to the first version of these tests.
+EARN_NOW = _dt(2026, 9, 14, 10, 0, tzinfo=ET)
 future_ts = pd.Timestamp("2026-09-15 16:30")
 past_ts = pd.Timestamp("2026-06-15 16:30")
 
-e_dict = cal.parse_earnings("GS", {"Earnings Date": [future_ts]}, None)
+e_dict = cal.parse_earnings("GS", {"Earnings Date": [future_ts]}, None, EARN_NOW)
 check("earnings parsed from a calendar dict",
       e_dict.when is not None and e_dict.source == "calendar", e_dict.note)
 check("parsed earnings carry reported confidence", e_dict.confidence == "reported")
 
-e_scalar = cal.parse_earnings("GS", {"Earnings Date": future_ts}, None)
+e_scalar = cal.parse_earnings("GS", {"Earnings Date": future_ts}, None, EARN_NOW)
 check("a scalar earnings date parses as well as a list",
       e_scalar.when is not None, e_scalar.note)
 
 e_df = cal.parse_earnings(
-    "CAT", None, pd.DataFrame({"EPS Estimate": [1.0]}, index=[future_ts]))
+    "CAT", None, pd.DataFrame({"EPS Estimate": [1.0]}, index=[future_ts]), EARN_NOW)
 check("earnings parsed from get_earnings_dates frame",
       e_df.when is not None and e_df.source == "earnings_dates", e_df.note)
 
-e_stale = cal.parse_earnings("MSFT", {"Earnings Date": [past_ts]}, None)
+e_stale = cal.parse_earnings("MSFT", {"Earnings Date": [past_ts]}, None, EARN_NOW)
 check("only-past earnings dates are rejected, not reported as next",
       e_stale.when is None, e_stale.note)
 check("stale earnings say why", "stale" in e_stale.note, e_stale.note)
 
-e_none = cal.parse_earnings("UNH", None, None)
+e_none = cal.parse_earnings("UNH", None, None, EARN_NOW)
 check("missing earnings data degrades safely",
       e_none.when is None and e_none.confidence == "none")
-e_junk = cal.parse_earnings("V", {"Earnings Date": ["not a date"]}, None)
+e_junk = cal.parse_earnings("V", {"Earnings Date": ["not a date"]}, None, EARN_NOW)
 check("unparseable earnings data degrades safely", e_junk.when is None)
 
 # ---- ex-dividend parsing ----------------------------------------------------
@@ -1809,7 +1813,283 @@ _shutil.rmtree(_tmpdir, ignore_errors=True)
 
 
 # ==========================================================================
-print("\n[13] Data layer guards")
+print("\n[13] Reversal readiness — observation only")
+# ==========================================================================
+import us30_reversal as rv  # noqa: E402
+
+
+class Lvls:
+    def __init__(self, **kw):
+        for k in ("overnight_high", "overnight_low", "prior_high", "prior_low",
+                  "ib_high", "ib_low"):
+            setattr(self, k, kw.get(k, float("nan")))
+
+
+class Swp:
+    def __init__(self, side, name, bars_ago=2, confirmed=True):
+        self.side, self.level_name = side, name
+        self.bars_ago, self.confirmed = bars_ago, confirmed
+
+
+def T(**kw):
+    d = dict(price=52000.0, atr14=400.0, vwap_distance_pts=-700.0,
+             rsi_decay=0.0, divergence="none", mean_reversion="none",
+             cpr=tech.compute_cpr(53400, 52900, 53000, 400, 52000))
+    d.update(kw)
+    return Stub(0, **d)
+
+
+def MI(**kw):
+    d = dict(levels=Lvls(overnight_low=51990.0, overnight_high=52700.0,
+                         prior_low=51950.0, prior_high=52800.0),
+             sweeps=[], delta_divergence="none", basis_sigma=float("nan"))
+    d.update(kw)
+    return Stub(0, **d)
+
+
+def AT(**kw):
+    d = dict(index_change_pts=-450.0, participation=-0.9, efficiency=-0.9,
+             top2_share=0.30)
+    d.update(kw)
+    return Stub(0, **d)
+
+
+def OP(**kw):
+    d = dict(expected_move_pts=500.0, gamma_regime="SHORT_GAMMA", gamma_levels=[])
+    d.update(kw)
+    return Stub(0, **d)
+
+
+# ---- the falling-knife guard: extended but nowhere near a level -------------
+# 52145 sits in the gap between Pivot S3 (52300) and the overnight low (51990)
+# — 0.39 ATR from the nearest support, outside the 0.30 proximity band.
+far = rv.assess(technicals=T(price=52145.0, vwap_distance_pts=-700.0),
+                micro=MI(), attribution=AT(), options=OP(),
+                regime=Stub(0, regime="TREND"))
+check("extended but not at a level stays DORMANT", far.state == rv.DORMANT,
+      f"{far.state} note={far.note}")
+check("the no-level refusal explains itself",
+      "falling-knife" in far.note, far.note)
+
+# ---- not extended at all -----------------------------------------------------
+calm = rv.assess(technicals=T(vwap_distance_pts=-50.0),
+                 micro=MI(), attribution=AT(index_change_pts=-20.0),
+                 options=OP(), regime=Stub(0, regime="TRANSITION"))
+check("no extension means nothing to reverse", calm.state == rv.DORMANT)
+check("calm state says so", "no extension" in calm.note, calm.note)
+
+# ---- ARMED: extended and sitting on the overnight low ------------------------
+armed = rv.assess(technicals=T(price=52000.0), micro=MI(), attribution=AT(),
+                  options=OP(), regime=Stub(0, regime="TRANSITION"))
+check("extended AND at a level arms", armed.state == rv.ARMED, armed.note)
+check("the reversal direction is opposite the extension",
+      armed.direction == "BULLISH", armed.direction)
+check("the arming level is named", armed.level is not None
+      and "Overnight low" in armed.level.name, str(armed.level))
+
+# ---- TRIGGERED: the level was swept and rejected -----------------------------
+trig = rv.assess(technicals=T(price=52000.0),
+                 micro=MI(sweeps=[Swp("low", "Overnight low", 2, True)]),
+                 attribution=AT(), options=OP(),
+                 regime=Stub(0, regime="TRANSITION"))
+check("a confirmed sweep triggers", trig.state == rv.TRIGGERED, trig.note)
+check("the sweep is named", trig.sweep_level == "Overnight low")
+check("evidence is evaluated once triggered", len(trig.evidence) == 5)
+
+# An UNconfirmed sweep (thin volume) must not trigger.
+thin = rv.assess(technicals=T(price=52000.0),
+                 micro=MI(sweeps=[Swp("low", "Overnight low", 2, False)]),
+                 attribution=AT(), options=OP(),
+                 regime=Stub(0, regime="TRANSITION"))
+check("a sweep on thin volume does NOT trigger", thin.state == rv.ARMED, thin.state)
+check("the thin sweep is explained", any("thin volume" in f for f in thin.flags),
+      str(thin.flags))
+
+# A sweep of the WRONG side must not trigger a bullish reversal.
+wrong = rv.assess(technicals=T(price=52000.0),
+                  micro=MI(sweeps=[Swp("high", "Prior day high", 2, True)]),
+                  attribution=AT(), options=OP(),
+                  regime=Stub(0, regime="TRANSITION"))
+check("a high sweep does not trigger a bullish reversal", wrong.state == rv.ARMED)
+
+# A stale sweep falls outside the window.
+stale = rv.assess(technicals=T(price=52000.0),
+                  micro=MI(sweeps=[Swp("low", "Overnight low", 40, True)]),
+                  attribution=AT(), options=OP(),
+                  regime=Stub(0, regime="TRANSITION"))
+check("a sweep older than the window does not trigger", stale.state == rv.ARMED)
+
+# ---- CONFIRMED: internals turn ------------------------------------------------
+conf = rv.assess(
+    technicals=T(price=52000.0, rsi_decay=1.2, divergence="bullish"),
+    micro=MI(sweeps=[Swp("low", "Overnight low", 2, True)],
+             delta_divergence="bullish"),
+    attribution=AT(participation=-0.2, efficiency=-0.9, top2_share=0.55),
+    options=OP(), regime=Stub(0, regime="TRANSITION"))
+check("enough evidence confirms", conf.state == rv.CONFIRMED, conf.note)
+check("all five evidence items present", conf.evidence_count == 5,
+      str([(e.key, e.present) for e in conf.evidence]))
+
+# The Dow-specific one in isolation: breadth ahead of price.
+breadth_only = rv.assess(
+    technicals=T(price=52000.0), micro=MI(sweeps=[Swp("low", "Overnight low", 2, True)]),
+    attribution=AT(participation=-0.2, efficiency=-0.9, top2_share=0.20),
+    options=OP(), regime=Stub(0, regime="TRANSITION"))
+_b = next(e for e in breadth_only.evidence if e.key == "breadth")
+check("breadth ahead of price is detected on its own", _b.present, _b.detail)
+check("a broad selloff does NOT show breadth exhaustion",
+      not next(e for e in trig.evidence if e.key == "breadth").present,
+      "participation and efficiency both -0.9 is a broad decline")
+check("concentration evidence fires when the decline narrows",
+      next(e for e in conf.evidence if e.key == "concentration").present)
+
+# ---- TREND raises the bar --------------------------------------------------------
+three = dict(
+    technicals=T(price=52000.0, rsi_decay=1.2, divergence="bullish"),
+    micro=MI(sweeps=[Swp("low", "Overnight low", 2, True)], delta_divergence="bullish"),
+    attribution=AT(participation=-0.9, efficiency=-0.9, top2_share=0.20),
+    options=OP())
+in_transition = rv.assess(**three, regime=Stub(0, regime="TRANSITION"))
+in_trend = rv.assess(**three, regime=Stub(0, regime="TREND"))
+check("3 of 5 confirms outside a trend", in_transition.state == rv.CONFIRMED,
+      f"{in_transition.evidence_count}/{in_transition.evidence_required}")
+check("the SAME evidence only triggers in TREND", in_trend.state == rv.TRIGGERED,
+      f"{in_trend.evidence_count}/{in_trend.evidence_required}")
+check("the raised bar is explained",
+      any("every support level fails" in f for f in in_trend.flags), str(in_trend.flags))
+
+# ---- bearish mirror ----------------------------------------------------------------
+bear = rv.assess(
+    technicals=T(price=52700.0, vwap_distance_pts=+700.0, rsi_decay=-1.2,
+                 divergence="bearish"),
+    micro=MI(sweeps=[Swp("high", "Overnight high", 2, True)],
+             delta_divergence="bearish"),
+    attribution=AT(index_change_pts=+450.0, participation=0.2, efficiency=0.9,
+                   top2_share=0.55),
+    options=OP(), regime=Stub(0, regime="TRANSITION"))
+check("the bearish mirror confirms", bear.state == rv.CONFIRMED, bear.note)
+check("bearish reversal direction is correct", bear.direction == "BEARISH")
+
+# ---- it reports what the master signal would have done -------------------------------
+check("C12 suppression is surfaced",
+      any("C12" in s for s in conf.suppressed_by), str(conf.suppressed_by))
+chop = rv.assess(
+    technicals=T(price=52000.0, rsi_decay=1.2, divergence="bullish"),
+    micro=MI(sweeps=[Swp("low", "Overnight low", 2, True)], delta_divergence="bullish"),
+    attribution=AT(participation=-0.2, efficiency=-0.9, top2_share=0.55),
+    options=OP(gamma_regime="NEUTRAL"), regime=Stub(0, regime="CHOP"))
+check("C3 suppression is surfaced", any("C3" in s for s in chop.suppressed_by),
+      str(chop.suppressed_by))
+
+# ---- levels --------------------------------------------------------------------------
+lv_all = rv.collect_levels(T(), MI(), [{"index_level": 51800.0, "kind": "support",
+                                        "tickers": "GS, CAT"}])
+check("levels gathered from pivots, session and options",
+      {l.source for l in lv_all} >= {"pivots", "session", "options"},
+      str({l.source for l in lv_all}))
+near = rv.nearest_level(lv_all, 52000.0, 400.0, "support")
+check("nearest support found and annotated",
+      near is not None and np.isfinite(near.distance_atr), str(near))
+check("nearest_level respects the kind filter",
+      rv.nearest_level(lv_all, 52000.0, 400.0, "resistance").kind == "resistance")
+check("no levels degrades safely", rv.nearest_level([], 52000.0, 400.0) is None)
+
+# ---- index gamma clusters -------------------------------------------------------------
+DIVI = config.DIVISOR_REFERENCE
+gn = [opt.NameGamma("GS", spot=1000.0, weight_pct=11.7),
+      opt.NameGamma("CAT", spot=800.0, weight_pct=9.2),
+      opt.NameGamma("NKE", spot=37.0, weight_pct=0.42)]
+gn[0].gamma_wall, gn[0].liquid = 990.0, True      # -10 -> -59 pts
+gn[1].gamma_wall, gn[1].liquid = 792.0, True      # -8  -> -48 pts
+gn[2].gamma_wall, gn[2].liquid = 30.0, True       # -7  -> -42 pts but tiny weight
+clusters = opt.index_gamma_levels(gn, DIVI, 52000.0)
+check("gamma walls translate into index levels", len(clusters) >= 1, str(clusters))
+check("the cluster sits below spot and is labelled support",
+      clusters[0]["index_level"] < 52000.0 and clusters[0]["kind"] == "support",
+      str(clusters[0]))
+check("GS and CAT cluster together",
+      "GS" in clusters[0]["tickers"] and "CAT" in clusters[0]["tickers"],
+      clusters[0]["tickers"])
+check("a $10 GS wall implies roughly 59 index points",
+      close_to(abs(clusters[0]["distance_pts"]), 54.0, 12.0),
+      f"{clusters[0]['distance_pts']}")
+check("illiquid or unwalled names are skipped",
+      opt.index_gamma_levels([opt.NameGamma("X", spot=100.0)], DIVI, 52000.0) == [])
+check("a bad divisor degrades safely",
+      opt.index_gamma_levels(gn, 0.0, 52000.0) == [])
+
+# ---- observation log --------------------------------------------------------------------
+log = rv.MemoryLogStore()
+NOW_R = pd.Timestamp("2026-09-18 11:00", tz=TZ).to_pydatetime()
+
+okl, whyl = rv.log_observation(log, armed, OP(), NOW_R)
+check("ARMED is not logged — it happens all day", not okl, whyl)
+okl2, _ = rv.log_observation(log, conf, OP(), NOW_R)
+check("CONFIRMED is logged", okl2)
+okl3, whyl3 = rv.log_observation(log, conf, OP(), NOW_R + pd.Timedelta(minutes=5))
+check("the same observation is deduped", not okl3, whyl3)
+okl4, _ = rv.log_observation(log, conf, OP(), NOW_R + pd.Timedelta(minutes=45))
+check("a later observation logs again", okl4)
+
+check("nothing is followed up before the window",
+      rv.fill_followups(log, 52100.0, NOW_R + pd.Timedelta(minutes=10)) == 0)
+filled = rv.fill_followups(log, 52180.0, NOW_R + pd.Timedelta(minutes=90))
+check("observations past the window are followed up", filled == 2, str(filled))
+
+after = log.load()
+check("the follow-up records what price did",
+      close_to(float(after.iloc[0]["move_pts"]), 180.0, 1e-6),
+      str(after.iloc[0]["move_pts"]))
+check("a bullish call that rose is marked right",
+      after.iloc[0]["went_the_right_way"] == "yes")
+
+log_wrong = rv.MemoryLogStore()
+rv.log_observation(log_wrong, conf, OP(), NOW_R)
+rv.fill_followups(log_wrong, 51800.0, NOW_R + pd.Timedelta(minutes=90))
+check("a bullish call that fell is marked wrong",
+      log_wrong.load().iloc[0]["went_the_right_way"] == "no")
+
+log_flat = rv.MemoryLogStore()
+rv.log_observation(log_flat, conf, OP(), NOW_R)
+rv.fill_followups(log_flat, 52002.0, NOW_R + pd.Timedelta(minutes=90))
+check("a tiny move is marked flat, not a win",
+      log_flat.load().iloc[0]["went_the_right_way"] == "flat")
+
+summ = rv.summarise(after)
+check("summary counts observations", summ["observations"] == 2)
+check("summary computes a hit rate", np.isfinite(summ["hit_rate"]), str(summ))
+check("summary splits by state", not summ["by_state"].empty)
+check("an empty log summarises safely",
+      rv.summarise(rv.empty_log())["observations"] == 0)
+
+# ---- it must not touch the master signal ------------------------------------------------
+check("reversal has no score attribute",
+      not hasattr(conf, "score"), "observation-only means no score")
+check("layers are still 7 and sum to 100",
+      len(config.LAYER_WEIGHTS) == 7 and sum(config.LAYER_WEIGHTS.values()) == 100)
+
+# ---- degradation -------------------------------------------------------------------------
+check("no inputs at all degrades safely",
+      rv.assess().state == rv.DORMANT and rv.assess().ok is False)
+check("missing micro degrades safely",
+      rv.assess(technicals=T(), attribution=AT(), options=OP()).ok)
+
+_saved_r = {}
+for _name in list(rv._CFG_DEFAULTS):
+    if hasattr(config, _name):
+        _saved_r[_name] = getattr(config, _name)
+        delattr(config, _name)
+check("stale reversal config is detected", sorted(rv.config_health()) == sorted(_saved_r))
+check("assess still runs on a stale config",
+      rv.assess(technicals=T(price=52000.0), micro=MI(), attribution=AT(),
+                options=OP(), regime=Stub(0, regime="TRANSITION")).state == rv.ARMED)
+for _name, _val in _saved_r.items():
+    setattr(config, _name, _val)
+check("reversal config restored", rv.config_health() == [])
+
+
+# ==========================================================================
+print("\n[14] Data layer guards")
 # ==========================================================================
 import data_layer as dl  # noqa: E402
 

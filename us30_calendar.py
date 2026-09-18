@@ -256,10 +256,15 @@ def _coerce_dates(value) -> list[pd.Timestamp]:
     return out
 
 
-def parse_earnings(ticker: str, calendar_obj, earnings_df) -> EarningsEntry:
+def parse_earnings(ticker: str, calendar_obj, earnings_df,
+                   now: datetime | None = None) -> EarningsEntry:
     """
     Pure parser over whatever yfinance handed back. Split out from the fetch so
     the test suite can drive every shape yfinance is known to return.
+
+    `now` is injectable because a parser that reads the wall clock cannot be
+    tested deterministically — fixtures written against absolute dates silently
+    rot into failures as those dates pass.
     """
     tz = ZoneInfo(config.MARKET_TZ)
     entry = EarningsEntry(ticker=ticker)
@@ -291,7 +296,7 @@ def parse_earnings(ticker: str, calendar_obj, earnings_df) -> EarningsEntry:
         entry.note = "no earnings date available"
         return entry
 
-    now = datetime.now(tz)
+    now = now or datetime.now(tz)
     future = []
     for ts in dates:
         dt = ts.to_pydatetime()

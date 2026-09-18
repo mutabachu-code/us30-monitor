@@ -67,7 +67,7 @@ trusting any panel. Its output will revise some assumptions.
 The synthetic suite covers the part that breaks quietly — the maths:
 
 ```bash
-python tests_synthetic.py       # 403 checks, no network required
+python tests_synthetic.py       # 460 checks, no network required
 ```
 
 ---
@@ -275,10 +275,11 @@ us30_regime.py         trend/chop/revert + dispersion regime
 us30_sectors.py        Dow-weighted sector RS (no XLU/XLRE — the Dow has neither)
 us30_calendar.py       event risk, earnings, ex-dividends, DJIA/NDX correlation
 us30_journal.py        signal ledger, realised expectancy, forward-test gates
+us30_reversal.py       reversal readiness state machine — OBSERVATION ONLY
 us30_master_signal.py  7-layer aggregation, C1–C10, trade plan
 app.py                 Streamlit UI, per-panel exception isolation
 validate_tickers.py    PHASE 0 — run this first
-tests_synthetic.py     403 checks against constructed data, no network
+tests_synthetic.py     460 checks against constructed data, no network
 ```
 
 ---
@@ -343,6 +344,57 @@ Two working options:
 2. **Run the durable copy on the MT5 host.** Your bot already imports these
    modules directly, and that machine has a real filesystem. `CsvStore` works
    there unchanged and `durable` reports `True`. This is the better path.
+
+---
+
+## Reversal readiness — observation only
+
+`us30_reversal.py` scores nothing, emits no trades and does not touch the
+master signal. It is testing one hypothesis before any code acts on it.
+
+**Why the master signal misses reversals — by design, not by bug.** C3 blocks
+directional entries in CHOP, which is what a decelerating selloff often reads
+as right at the turn. C12 blocks mean-reversion setups in short gamma, which is
+exactly the environment a flush into support creates. And confluence peaks in
+the *middle* of a move: at the actual low most layers are still bearish, so by
+the time enough flip to clear the ±25 gate the reversal is 100+ points old. All
+three are correct for continuation trades — which is why reversals cannot be
+reached by tuning them.
+
+**The structural claim.** Continuation asks *"which way is price going?"* — a
+confluence question, answered by summing evidence. A reversal asks *"is this
+move dying, here, at this level?"* — a **sequential** question. Stretch → level
+→ sweep → rejection → internals turn. Scrambled, those ingredients mean
+nothing, and a weighted sum cannot express "in this order". Hence a state
+machine: DORMANT → ARMED → TRIGGERED → CONFIRMED.
+
+**No level, no arm.** Extension alone never arms it. Price must be within 0.30
+ATR of a known level (pivots, session extremes, or an index-level gamma
+cluster). That refusal is the falling-knife guard and the most important rule
+in the module.
+
+**A sweep is the trigger, and it must be confirmed.** `us30_micro` already
+detects level-taken-out-and-rejected with RVOL confirmation. A sweep on thin
+volume is reported and explicitly not counted.
+
+**The Dow-specific evidence is the reason this is worth testing here.** Because
+the index is price-weighted, point attribution is exact — so "participation
+−0.15 against efficiency −0.88" is a measurable statement that breadth has
+turned while the points have not. On a cap-weighted index that comparison is
+approximate; here it is arithmetic.
+
+**TREND raises the bar to 4 of 5.** In a real trend day every support level
+fails, and that is where a reversal engine bleeds.
+
+**State is derived, never stored.** Streamlit reruns constantly and a stored
+state machine drifts out of sync with the data it claims to describe.
+Everything is recomputed from current bars each run. The only thing persisted
+is the observation log — which records each TRIGGERED/CONFIRMED and then, 30
+minutes later, what price actually did. Without that, "watch it for a week"
+means remembering the times it looked right.
+
+Nothing here is allowed to influence a trade until that log says the sequence
+precedes turns more often than not.
 
 ---
 

@@ -16,7 +16,8 @@ from __future__ import annotations
 # AttributeError before a single panel renders.
 #   1 = phases 0-3   2 = phase 4 (microstructure)   3 = phase 5 (options)
 #   4 = phase 6 (calendar)   5 = phase 7 (journal)
-CONFIG_VERSION = 5
+#   6 = reversal readiness (observation only)
+CONFIG_VERSION = 6
 
 # ----------------------------------------------------------------------------
 # Constituents (seed list — verified 12 Sep 2026, post GOOGL/VZ swap of 29 Jun 2026)
@@ -266,6 +267,27 @@ JOURNAL_CI_Z = 1.96          # 95%
 # Targets from the research doc, restated here so the app can grade itself.
 TARGET_EXPECTANCY_PTS = 8.0
 TARGET_PROFIT_FACTOR = 1.4
+
+# ----------------------------------------------------------------------------
+# Reversal readiness — OBSERVATION ONLY
+# ----------------------------------------------------------------------------
+# This does NOT score into the master signal and does NOT emit trades. It is a
+# watch-and-record instrument: the hypothesis is that a reversal is SEQUENTIAL
+# (stretch -> level -> sweep -> rejection -> internals turn) rather than
+# confluent, and the only way to find out is to log the sequence and see
+# whether it actually precedes turns.
+REVERSAL_STRETCH_ATR = 1.5        # VWAP distance, in ATR
+REVERSAL_RANGE_ATR = 1.2          # day range vs ATR20, alternative arm trigger
+REVERSAL_LEVEL_PROXIMITY_ATR = 0.30
+REVERSAL_EXPECTED_MOVE_USED = 0.70
+REVERSAL_SWEEP_MAX_BARS = 12
+REVERSAL_MIN_EVIDENCE = 3         # of 5
+REVERSAL_TREND_MIN_EVIDENCE = 4   # stricter in TREND: every level fails in one
+REVERSAL_BREADTH_GAP = 0.25       # participation minus efficiency
+REVERSAL_CONCENTRATION = 0.45     # decline narrowing to few names
+REVERSAL_LOG_PATH = "us30_reversal_log.csv"
+REVERSAL_FOLLOWUP_MINUTES = 30    # how long after a trigger to record what happened
+REVERSAL_DEDUP_MINUTES = 30
 
 # Time-of-day blocks (US/Eastern). Score the same setup differently by block.
 SESSION_BLOCKS = [

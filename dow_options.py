@@ -184,6 +184,7 @@ class OptionsReport:
     weighted_pcr: float = float("nan")
     weighted_skew: float = float("nan")
     expected_move_pts: float = float("nan")
+    gamma_levels: list[dict] = field(default_factory=list)   # index-level clusters
 
     dia_net_gex: float = float("nan")
     dia_total_oi: int = 0
@@ -471,6 +472,64 @@ def aggregate(names: list[NameGamma], total_top_weight: float,
 # ==========================================================================
 # Fetch + compute
 # ==========================================================================
+def index_gamma_levels(names: list[NameGamma], divisor: float,
+                       index_level: float, cluster_atr: float = 120.0) -> list[dict]:
+    """
+    Translate per-name gamma walls into DJIA levels, then cluster them.
+
+    A gamma wall on GS at $1050 while GS trades $1037 is +$13, which on a
+    price-weighted index is +13/divisor = +77 DJIA points from here. That
+    displacement IS an index level. Individually these are weak; where several
+    heavyweight names' walls imply the SAME index level, that cluster is a real
+    zone where dealer hedging concentrates.
+
+    Reported as clusters rather than one number, because averaging unrelated
+    walls into a single "index gamma wall" would be invented precision.
+    """
+    out: list[dict] = []
+    if not names or not np.isfinite(divisor) or divisor <= 0 or not np.isfinite(index_level):
+        return out
+
+    points: list[tuple[float, float, str]] = []
+    for n in names:
+        if not n.liquid or not np.isfinite(n.gamma_wall) or not np.isfinite(n.spot):
+            continue
+        implied = index_level + (n.gamma_wall - n.spot) / divisor
+        points.append((implied, n.weight_pct, n.ticker))
+    if not points:
+        return out
+
+    points.sort(key=lambda p: p[0])
+    cluster: list[tuple[float, float, str]] = [points[0]]
+    for p in points[1:]:
+        if p[0] - cluster[-1][0] <= cluster_atr:
+            cluster.append(p)
+        else:
+            out.append(_cluster_to_level(cluster, index_level))
+            cluster = [p]
+    out.append(_cluster_to_level(cluster, index_level))
+
+    # Only clusters with real weight behind them are worth showing.
+    out = [c for c in out if c["weight_pct"] >= 5.0]
+    return sorted(out, key=lambda c: -c["weight_pct"])
+
+
+def _cluster_to_level(cluster: list[tuple[float, float, str]],
+                      index_level: float) -> dict:
+    weights = np.array([c[1] for c in cluster], dtype=float)
+    levels = np.array([c[0] for c in cluster], dtype=float)
+    total = float(weights.sum())
+    centre = float(np.sum(levels * weights) / total) if total > 0 else float(levels.mean())
+    return {
+        "index_level": round(centre, 1),
+        "weight_pct": round(total, 2),
+        "tickers": ", ".join(c[2] for c in cluster),
+        "n": len(cluster),
+        "kind": "support" if centre < index_level else "resistance",
+        "distance_pts": round(centre - index_level, 1),
+    }
+
+
 def get_options(attribution=None, rate: float | None = None) -> OptionsReport:
     """
     Live options layer. `attribution` supplies the LIVE price-weight ranking —
@@ -521,6 +580,12 @@ def get_options(attribution=None, rate: float | None = None) -> OptionsReport:
         else:
             dia_note = dia_chain.get("note", "DIA chain unavailable")
 
-        return aggregate(names, total_top_weight, dia_gex, dia_oi, dia_note)
+        rep = aggregate(names, total_top_weight, dia_gex, dia_oi, dia_note)
+        try:
+            rep.gamma_levels = index_gamma_levels(
+                names, rep_attr.divisor.value, rep_attr.index_level)
+        except Exception:  # noqa: BLE001
+            rep.gamma_levels = []
+        return rep
     except Exception as exc:  # noqa: BLE001
         return OptionsReport(note=f"options failed: {exc}")

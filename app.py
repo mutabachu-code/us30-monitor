@@ -30,6 +30,7 @@ import us30_calendar as cal_mod
 import us30_journal as journal_mod
 import us30_macro as macro_mod
 import us30_micro as micro_mod
+import us30_reversal as rev_mod
 import us30_regime as regime_mod
 import us30_sectors as sectors_mod
 import us30_technicals as tech_mod
@@ -44,7 +45,7 @@ st.set_page_config(page_title="US30 Monitor", page_icon="📉", layout="wide")
 # lands a module before its config constants used to kill the app at import
 # time with a redacted AttributeError. Now the modules carry their own
 # fallbacks and this banner names exactly which file is behind.
-EXPECTED_CONFIG_VERSION = 5
+EXPECTED_CONFIG_VERSION = 6
 
 
 # Lives in data_layer so it is unit-testable; reached through getattr so that a
@@ -53,7 +54,7 @@ _module_health = getattr(dl, "module_health", lambda m: ([], []))
 
 _missing: list[str] = []
 _stale_modules: list[str] = []
-for _mod in (micro_mod, options_mod, cal_mod, journal_mod):
+for _mod in (micro_mod, options_mod, cal_mod, journal_mod, rev_mod):
     _m, _s = _module_health(_mod)
     _missing += _m
     _stale_modules += _s
@@ -233,12 +234,44 @@ with st.spinner("Loading engines..."):
         metrics = journal_mod.Metrics()
         logged, log_reason = False, f"journal crashed: {exc}"
 
+    # ---- reversal readiness: OBSERVATION ONLY ----------------------------
+    # Scores nothing, emits nothing, touches no other layer. It watches and
+    # records so that a week of observation produces evidence.
+    try:
+        reversal = rev_mod.assess(
+            technicals=technicals, micro=micro, attribution=attribution,
+            options=options, regime=regime,
+            gamma_levels=getattr(options, "gamma_levels", []))
+        rev_store = rev_mod.get_store()
+        rev_mod.fill_followups(rev_store, technicals.price, now_et)
+        rev_logged, rev_reason = rev_mod.log_observation(
+            rev_store, reversal, options, now_et)
+        rev_frame = rev_store.load()
+        rev_summary = rev_mod.summarise(rev_frame)
+    except Exception as exc:  # noqa: BLE001
+        reversal = rev_mod.ReversalReport(note=f"reversal crashed: {exc}")
+        rev_store = rev_mod.MemoryLogStore()
+        rev_frame = rev_mod.empty_log()
+        rev_summary = rev_mod.summarise(rev_frame)
+        rev_logged, rev_reason = False, str(exc)
+
 
 # ==========================================================================
 # Master signal
 # ==========================================================================
 @panel("Master signal")
 def render_signal():
+    # Reversal watch is observation-only, but it is no use buried in a tab —
+    # the whole point is to notice the sequence while it is happening.
+    if reversal.ok and reversal.state in ("TRIGGERED", "CONFIRMED"):
+        icon = "🟠" if reversal.state == "TRIGGERED" else "🟢"
+        st.info(
+            f"{icon} **Reversal watch: {reversal.state}** — {reversal.direction} "
+            f"at {reversal.level.name if reversal.level else 'a level'}, "
+            f"{reversal.evidence_count}/{reversal.evidence_required} evidence. "
+            f"Observation only, no trade implied. See the Reversal tab."
+        )
+
     st.subheader("Master signal")
 
     colour = {"LONG": "🟢", "SHORT": "🔴", "NEUTRAL": "⚪"}[signal.direction]
@@ -713,6 +746,132 @@ def _humanise_minutes(minutes: float) -> str:
     return f"{minutes / 1440:.1f} days"
 
 
+@panel("Reversal readiness")
+def render_reversal():
+    st.subheader("Reversal readiness — observation only")
+    st.info(
+        "**This scores nothing and emits no trades.** It is testing one "
+        "hypothesis: that a reversal is *sequential* — stretch, then a level, "
+        "then a sweep, then the internals turn — rather than confluent. The "
+        "master signal sums evidence, which peaks in the middle of a move, not "
+        "at its end. Watch this for a week against live tape before anything "
+        "here is allowed to influence a trade."
+    )
+
+    r = reversal
+    if not r.ok:
+        st.warning(r.note or "reversal readiness unavailable")
+        return
+
+    badge = {"DORMANT": "⚪", "ARMED": "🟡", "TRIGGERED": "🟠", "CONFIRMED": "🟢"}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("State", f"{badge.get(r.state, '⚪')} {r.state}")
+    c2.metric("Direction", r.direction if r.direction != "NONE" else "—",
+              help="A reversal is expected OPPOSITE the current extension.")
+    c3.metric("Evidence", f"{r.evidence_count} / {r.evidence_required}",
+              "TREND: bar raised" if r.regime == "TREND" else "")
+    c4.metric("Stretch",
+              f"{r.stretch_atr:+.2f} ATR" if np.isfinite(r.stretch_atr) else "—",
+              f"o/n range {r.overnight_range_atr:.2f} ATR"
+              if np.isfinite(r.overnight_range_atr) else "")
+
+    # ---- the sequence, in order ------------------------------------------
+    st.markdown("**The sequence** — these must arrive in this order to mean anything")
+    steps = [
+        ("1 · Extension", r.state != "DORMANT" or np.isfinite(r.stretch_atr),
+         f"{r.stretch_atr:+.2f} ATR from VWAP" if np.isfinite(r.stretch_atr) else "not extended"),
+        ("2 · At a level", r.state in ("ARMED", "TRIGGERED", "CONFIRMED"),
+         f"{r.level.name} @ {r.level.price:,.0f} "
+         f"({r.level.distance_pts:+.0f} pts)" if r.level else "no level in range"),
+        ("3 · Swept & rejected", r.state in ("TRIGGERED", "CONFIRMED"),
+         f"{r.sweep_level}, {r.sweep_bars_ago} bars ago" if r.sweep_level
+         else "no confirmed sweep"),
+        ("4 · Internals turned", r.state == "CONFIRMED",
+         f"{r.evidence_count} of {r.evidence_required} required"),
+    ]
+    for label, done, detail in steps:
+        st.markdown(f"{'✅' if done else '⬜'} **{label}** — {detail}")
+
+    if r.state == "DORMANT" and "falling-knife" in (r.note or ""):
+        st.caption(
+            "Extended but not at a level, so no arm. That refusal is the most "
+            "important rule here — it is what stops this from catching knives."
+        )
+
+    # ---- evidence ledger ---------------------------------------------------
+    if not r.evidence_frame.empty:
+        st.markdown("**Evidence** — the internals check, once a level has been swept")
+        st.dataframe(r.evidence_frame, width="stretch", hide_index=True)
+        st.caption(
+            "*Breadth turning ahead of price* is the Dow-specific one and the "
+            "reason this is worth testing here rather than on NAS100. Because "
+            "the index is price-weighted, point attribution is exact — so "
+            "'the index is still making lower lows but only two names are "
+            "still dragging it' is a measurable statement, not an impression."
+        )
+
+    if r.suppressed_by:
+        st.warning(
+            "**The master signal would not have taken this:** "
+            + "; ".join(r.suppressed_by)
+            + ". That is by design — those rules protect the continuation "
+            "trades. It is also exactly why reversals need their own path."
+        )
+    for f in r.flags:
+        st.caption(f"• {f}")
+
+    # ---- gamma levels -------------------------------------------------------
+    glevels = getattr(options, "gamma_levels", []) or []
+    if glevels:
+        st.markdown("**Index-level gamma clusters**")
+        st.dataframe(pd.DataFrame(glevels), width="stretch", hide_index=True)
+        st.caption(
+            "Each name's gamma wall translated into a DJIA level via the "
+            "divisor, then clustered. Individually weak; where several "
+            "heavyweights imply the same level, that zone is where dealer "
+            "hedging concentrates. Shown as clusters, not one number, because "
+            "averaging unrelated walls would be invented precision."
+        )
+
+    # ---- the observation log ------------------------------------------------
+    st.markdown("---")
+    st.markdown("**Observation log** — what actually happened afterwards")
+    warn = journal_mod.storage_warning(rev_store)
+    if warn:
+        st.error(f"**{warn}**")
+
+    s = rev_summary
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("Observations", s["observations"])
+    o2.metric("Resolved", s["resolved"],
+              help=f"Followed up {getattr(config, 'REVERSAL_FOLLOWUP_MINUTES', 30):.0f} "
+                   f"minutes after the observation")
+    o3.metric("Went the right way",
+              f"{s['hit_rate'] * 100:.0f}%" if np.isfinite(s["hit_rate"]) else "—",
+              f"{s['right']} right / {s['wrong']} wrong / {s['flat']} flat")
+    o4.metric("Average move",
+              f"{s['avg_move']:+.0f} pts" if np.isfinite(s["avg_move"]) else "—")
+
+    if s["resolved"] < 10:
+        st.caption(
+            f"⚠️ {s['resolved']} resolved observations. Far too few to mean "
+            f"anything — this is here so that after a week you have a record "
+            f"instead of a memory of the times it looked right."
+        )
+    if not s["by_state"].empty:
+        st.markdown("**CONFIRMED vs TRIGGERED** — does the extra evidence earn its keep?")
+        st.dataframe(s["by_state"], width="stretch")
+
+    st.caption(f"Auto-log: {rev_reason}")
+    if not rev_frame.empty:
+        st.download_button(
+            "Download observation log",
+            rev_frame.to_csv(index=False).encode(),
+            file_name=f"us30_reversal_log_{now_et:%Y%m%d}.csv", mime="text/csv")
+        st.dataframe(rev_frame.sort_values("observed_at", ascending=False),
+                     width="stretch", height=300)
+
+
 @panel("Journal")
 def render_journal():
     st.subheader("Forward-test journal")
@@ -878,8 +1037,8 @@ render_signal()
 st.divider()
 
 tabs = st.tabs(["Attribution", "Technicals", "Microstructure", "Options",
-                "Macro", "Regime", "Sectors", "Calendar", "Journal",
-                "Diagnostics"])
+                "Macro", "Regime", "Sectors", "Calendar", "Reversal",
+                "Journal", "Diagnostics"])
 with tabs[0]:
     render_attribution()
 with tabs[1]:
@@ -897,8 +1056,10 @@ with tabs[6]:
 with tabs[7]:
     render_calendar()
 with tabs[8]:
-    render_journal()
+    render_reversal()
 with tabs[9]:
+    render_journal()
+with tabs[10]:
     st.subheader("Diagnostics")
     st.write({
         "attribution": attribution.note,
@@ -906,6 +1067,7 @@ with tabs[9]:
         "microstructure": micro.note,
         "options": options.note,
         "calendar": calendar.note,
+        "reversal": f"{reversal.state}/{reversal.direction} — {reversal.note}",
         "journal": f"{metrics.n_closed} closed / {metrics.n_open} open at {store.location}",
         "journal_durable": getattr(store, "durable", False),
         "macro": macro.note,
